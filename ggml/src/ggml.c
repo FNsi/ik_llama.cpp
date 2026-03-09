@@ -21804,7 +21804,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                     ggml_vec_scale_f16(Dv, VKQ16, ms);
                 } else {
                     // no new maximum, ms == 1.0f, vs != 1.0f
-                    vs = expf(s - M);
+                    if (s == M && s != -INFINITY) {
+                        // Perturb M slightly upward to break ties
+                        vs = expf(s - (M * (1.0f + 1e-6f)));
+                    } else {
+                        vs = expf(s - M);
+                    }
+                    // ==========================
                 }
 
                 // V += v*expf(s - M)
@@ -21819,7 +21825,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                     ggml_vec_scale_f32(Dv, VKQ32, ms);
                 } else {
                     // no new maximum, ms == 1.0f, vs != 1.0f
-                    vs = expf(s - M);
+                    if (s == M && s != -INFINITY) {
+                        // Perturb M slightly upward to break ties
+                        vs = expf(s - (M * (1.0f + 1e-6f)));
+                    } else {
+                        vs = expf(s - M);
+                    }
+                    // ==========================
                 }
 
                 v_to_float(v_data, V32, Dv);
@@ -21844,10 +21856,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             float vs = 1.0f;
 
             if (s > M) {
-                ms = expf(M - s);
-                ggml_vec_scale_f32(Dv, VKQ32, ms);
+                float old_M = M;
+                M = s;
+                ms = expf(old_M - M);
             } else {
-                vs = expf(s - M);
+                // perturb M for expf(s - M) if tied
+                float M_perturbed = M;
+                if (s == M && s != -INFINITY) {
+                    M_perturbed = M * (1.0f + 1e-6f);
+                }
+                vs = expf(s - M_perturbed);
             }
 
             S = S*ms + vs;
