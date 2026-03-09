@@ -1596,6 +1596,23 @@ static ggml_tensor * llm_build_kqv(
             struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
             cb(kq, "kq", il);
 
+        // --- DySCO: Inject bias from QRHead attention ---
+        if (lctx.dy_sco_bias_cpu.size() > 0 && kq->ne[1] == 1) {
+            // Create bias tensor in the graph's context
+            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kq->ne[0]);
+            ggml_set_name(bias, "dy_sco_bias");
+    
+            // Copy bias from CPU vector to tensor
+            ggml_build_forward_expand(graph, bias);
+            ggml_backend_tensor_set(bias, lctx.dy_sco_bias_cpu.data(), 0, kq->ne[0] * sizeof(float));
+    
+            // Broadcast to [n_kv, n_tokens] and add to kq
+            ggml_tensor * bias_bcast = ggml_repeat(ctx, bias, kq);
+            kq = ggml_add(ctx, kq, bias_bcast);
+            cb(kq, "kq_dy_sco", il);
+        }
+        // -----------------------------------------------
+          
             //ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
             if (should_use_f32_precision) {

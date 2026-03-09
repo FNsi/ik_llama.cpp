@@ -26,7 +26,21 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
     float defrag_thold;
+    
+    bool dy_sco_enabled;
+    float dy_sco_beta;         // e.g., 1.7
+    float dy_sco_top_p;        // e.g., 0.95
+    int * dy_sco_qr_head_ids;  // e.g., [17,18,19,20]
+    int dy_sco_n_qr_heads;
+/**
 
+ *     DySCO Parameters:
+ *   - DySCO is a decoding-time optimization that improves long-context reasoning
+ *     by dynamically up-weighting tokens identified by retrieval heads (QRHeads).
+ *   - To enable: set `params.dy_sco_enabled = true` and provide `dy_sco_qr_head_ids`.
+ *   - Recommended: `dy_sco_beta = 1.7`, `dy_sco_top_p = 0.95`
+ *   - QRHead layer IDs are model-specific — see model docs or use `llama-qrhead` tool.
+ */
     bool embeddings;
     bool causal_attn;
     bool offload_kqv;

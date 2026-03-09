@@ -125,6 +125,58 @@
 //
 // helpers
 //
+// In llama.cpp, at the top (after includes):
+#include <algorithm>
+#include <numeric>
+
+// --- DySCO: Helper functions (local to llama.cpp) ---
+
+// Compute QRHead relevance scores (CPU, returns false on error)
+static bool dy_sco_compute_relevance(
+        const llama_context & lctx,
+        int32_t n_kv,
+        const int * qr_head_ids,
+        int n_qr_heads,
+        std::vector<float> & h_relevance) {
+    // TODO: Implement actual QRHead attention aggregation
+    // For now, return false to disable DySCO (safely)
+    return false;  // We'll implement this next
+}
+
+// Apply top-p selection + log(β) bias
+static void dy_sco_apply_top_p(
+        std::vector<float> & h_bias,
+        const std::vector<float> & h_relevance,
+        float beta,
+        float top_p) {
+    const int n = h_relevance.size();
+    if (n == 0) return;
+
+    // 1. Sort indices by relevance (descending)
+    std::vector<int> indices(n);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(), [&h_relevance](int a, int b) {
+        return h_relevance[a] > h_relevance[b];
+    });
+
+    // 2. Accumulate until cumsum >= top_p
+    float cumsum = 0.0f;
+    std::vector<bool> mask(n, false);
+    for (int i = 0; i < n; ++i) {
+        int idx = indices[i];
+        mask[idx] = true;
+        cumsum += h_relevance[idx];
+        if (cumsum >= top_p) break;
+    }
+
+    // 3. Build bias: log(β) for selected tokens, 0 otherwise
+    const float log_beta = logf(beta);
+    for (int i = 0; i < n; ++i) {
+        h_bias[i] = mask[i] ? log_beta : 0.0f;
+    }
+}
+// ---------------------------------------------------
+
 
 
 static bool is_utf8_whitespace(uint8_t c) {
@@ -3297,6 +3349,31 @@ static int llama_decode_internal(
             /* .all_seq_id = */ batch_all.all_seq_id,
         };
 
+        // --- DySCO: Compute bias for decoding step (n_tokens=1 only) ---
+        if (u_batch.n_tokens == 1 && 
+            lctx.cparams.dy_sco_enabled && 
+            lctx.dy_sco_bias_cpu.empty()) {
+    
+            const int32_t n_kv = lctx.kv_self.n;
+
+            // Compute relevance from QRHead attention
+            std::vector<float> h_relevance(n_kv, 0.0f);
+            if (!dy_sco_compute_relevance(lctx, n_kv, 
+                    lctx.cparams.dy_sco_qr_head_ids, 
+                    lctx.cparams.dy_sco_n_qr_heads, 
+                    h_relevance)) {
+                LLAMA_LOG_WARN("[DySCO] Failed to compute relevance — disabling DySCO\n");
+                lctx.cparams.dy_sco_enabled = false;
+            } else {
+                // Apply top-p selection + log(β) bias
+                lctx.dy_sco_bias_cpu.resize(n_kv, 0.0f);
+                dy_sco_apply_top_p(lctx.dy_sco_bias_cpu, h_relevance, 
+                                   lctx.cparams.dy_sco_beta, lctx.cparams.dy_sco_top_p);
+            }
+        }
+        // ---------------------------------------------------------------
+
+
         // count the outputs in this u_batch
         {
             int32_t n_outputs_new = 0;
@@ -3575,6 +3652,11 @@ static int llama_decode_internal(
             tim2 = ggml_time_us();
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
 #endif
+        }
+        
+        if (!lctx.dy_sco_bias_cpu.empty()) {
+            LLAMA_LOG_DEBUG("[DySCO] Clearing bias for next step\n");
+            lctx.dy_sco_bias_cpu.clear();
         }
         n_outputs_prev += lctx.n_outputs;
         cur_token += n_tokens;
@@ -4788,6 +4870,20 @@ struct llama_context * llama_init_from_model(
     // the batch has to be at least GGML_KQ_MASK_PAD because we will be padding the KQ_mask
     // this is required by GPU kernels in order to avoid out-of-bounds accesses (e.g. ggml_flash_attn_ext)
     // ref: https://github.com/ggerganov/llama.cpp/pull/5021
+
+// --- DySCO: Validate DySCO config ---
+    if (cparams.dy_sco_enabled) {
+        if (cparams.dy_sco_n_qr_heads <= 0 || !cparams.dy_sco_qr_head_ids) {
+            LLAMA_LOG_WARN("%s: dy_sco_enabled=true but no QRHead layers provided — disabling DySCO\n", __func__);
+            cparams.dy_sco_enabled = false;
+        } else if (cparams.dy_sco_beta <= 1.0f) {
+            LLAMA_LOG_WARN("%s: dy_sco_beta must be > 1.0 (got %f) — disabling DySCO\n", __func__, cparams.dy_sco_beta);
+            cparams.dy_sco_enabled = false;
+        }
+    }
+// -----------------------------------
+
+    
     if (cparams.n_batch < GGML_KQ_MASK_PAD) {
         LLAMA_LOG_WARN("%s: n_batch is less than GGML_KQ_MASK_PAD - increasing to %d\n", __func__, GGML_KQ_MASK_PAD);
         cparams.n_batch = GGML_KQ_MASK_PAD;

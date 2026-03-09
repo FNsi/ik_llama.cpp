@@ -183,7 +183,9 @@ struct llama_context {
     // output of the encoder part of the encoder-decoder models
     std::vector<float> embd_enc;
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
-
+    // DySCO: Temporary buffer for bias tensor (computed per decode step)
+    std::vector<float> dy_sco_bias_cpu;  // [n_kv], used in llama_decode_internal() and llm_build_kqv()
+    // =====================
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
     ggml_backend_sched_t sched = nullptr;
