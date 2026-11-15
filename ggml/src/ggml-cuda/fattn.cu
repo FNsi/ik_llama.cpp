@@ -13,7 +13,7 @@
 #include "fattn-mma-f16-interface.cuh"
 #include "fattn-new-mma.cuh"
 #include "fattn.cuh"
-#include "convert.cuh"
+#include "dsa_attn.cuh"
 
 #include <cstdint>
 
@@ -21,6 +21,29 @@
 
 static inline bool mma_better_than_turing(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > CC_TURING;
+}
+
+// On GPUs without fp16 MMA (Pascal/sm_60), the MLA absorbed head sizes 576/512 are asymmetric, so the f16
+// vector kernel (which requires K==V) rejects them and decode falls back to the CPU. Route MLA decode
+// (batch <= 8) to the f32 vector kernel to keep it on the GPU. Single-sourced so the dispatch and the
+// is_supported check cannot drift.
+static inline bool is_pascal_mla_absorbed_decode(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+    return Q->ne[1] <= 8 && K->ne[0] == 576 && V->ne[0] == 512;
+}
+
+// Pascal has no other kernel for head size 512 (the Gemma-4 global layers), in prefill or decode.
+static inline bool is_pascal_hs512(const int cc, const ggml_tensor * K, const ggml_tensor * V) {
+    return cc >= CC_PASCAL && cc < CC_VOLTA && K->ne[0] == 512 && V->ne[0] == 512;
+}
+
+static __global__ void k_index_to_mask(const int * __restrict__ idx, half * __restrict__ mask, const int n_idx, const int s1, const int n_kv) {
+    idx  += int64_t(s1)*blockIdx.x;
+    mask += int64_t(n_kv)*blockIdx.x;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) mask[j] = __float2half(-INFINITY);
+    __syncthreads();
+    for (int j = threadIdx.x; j < n_idx; j += blockDim.x) {
+        if (idx[j] >= 0) mask[idx[j]] = __float2half(0.0f);
+    }
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -34,6 +57,35 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    ggml_cuda_pool_alloc<half> idx_mask(ctx.pool());
+    ggml_tensor idx_dst, Mi;
+    if (dst->src[5]) {
+        if (ggml_cuda_flash_attn_ext_mma_new_sparse(ctx, dst)) {
+            return;
+        }
+        if (!mask) {
+            const ggml_tensor * kv_idx = dst->src[5];
+            Mi = *kv_idx;
+            Mi.type  = GGML_TYPE_F16;
+            Mi.ne[0] = K->ne[1];
+            Mi.nb[0] = sizeof(half);
+            Mi.nb[1] = Mi.ne[0]*Mi.nb[0];
+            Mi.nb[2] = Mi.ne[1]*Mi.nb[1];
+            Mi.nb[3] = Mi.ne[2]*Mi.nb[2];
+            Mi.data  = idx_mask.alloc(ggml_nelements(&Mi));
+            k_index_to_mask<<<ggml_nrows(&Mi), 256, 0, ctx.stream()>>>((const int *)kv_idx->data, (half *)Mi.data,
+                    kv_idx->ne[0], kv_idx->nb[1]/sizeof(int), Mi.ne[0]);
+            CUDA_CHECK(cudaGetLastError());
+            idx_dst = *dst;
+            idx_dst.src[3] = &Mi;
+            dst  = &idx_dst;
+            mask = &Mi;
+        }
+        if (ggml_cuda_dsa_attn_ext(ctx, dst)) {
+            return;
+        }
+    }
 
     ggml_tensor local_dst, Kl, Vl, Ml;
     if (n_swa > 0) {
@@ -66,8 +118,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    if (is_pascal_hs512(cc, K, V)) {
+        ggml_cuda_flash_attn_ext_tile_new(ctx, dst);
+        return;
+    }
+
     if (!fast_fp16_available(cc)) {
-        if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+        if (Q->ne[1] <= 8) {
             ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
@@ -76,14 +133,35 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (!fp16_mma_available(cc)) {
+        if (is_pascal_mla_absorbed_decode(Q, K, V)) {
+            ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+            return;
+        }
+        // With GQA the vec kernel reads every K/V row once per Q head. The tile kernel packs 4 or 8 Q heads per K/V head.
+        if (cc == CC_PASCAL && Q->ne[1] == 1 && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0) && V->type == K->type &&
+            ggml_cuda_fattn_tile_new_is_supported(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_tile_new(ctx, dst);
+            return;
+        }
         if (precision == GGML_PREC_DEFAULT) {
-            if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
-                ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
+            if (Q->ne[1] <= 8) {
+                // P100 (sm_60/CC_PASCAL): the fp16 vec kernel accumulates the online-softmax
+                // denominator and the P*V product in fp16, flipping ~3-4% of decode top-1 tokens
+                // vs fp32 (llama.cpp#25593). Decode is bandwidth-bound on P100 so vec_f32 is free.
+                if (cc == CC_PASCAL) {
+                    ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
+                }
+            } else if (Q->ne[0] == 256) {
+                ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
+            } else if (ctx.fabsum) {
+                ggml_cuda_flash_attn_ext_tile_f16_fabsum(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
             }
         } else {
-            if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+            if (Q->ne[1] <= 8) {
                 ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
@@ -92,13 +170,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    int gqa_ratio = Q->ne[2] / K->ne[2];
+
     if (new_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[0] == 128 && Q->ne[1] == 1 &&
-            (Q->ne[2] / K->ne[2] == 12 || Q->ne[2] / K->ne[2] == 6 || Q->ne[2] / K->ne[2] == 10)) {
+            (gqa_ratio == 12 || gqa_ratio == 6 || gqa_ratio == 10)) {
         ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
         return;
     }
 
-    if (new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 && Q->ne[2] / K->ne[2] == 6) {
+    if (new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 && (gqa_ratio == 6 || gqa_ratio == 12)) {
         ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
         return;
     }
@@ -110,7 +190,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     //const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && cc < CC_ADA_LOVELACE && !mma_needs_data_conversion;
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && K->ne[0] == V->ne[0] && Q->ne[0] % (2*WARP_SIZE) == 0;
-    if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+    // On sm_70 (Volta) there is no Turing+ MMA kernel; quantized KV decode would fall back to the WMMA
+    // kernel, which re-converts the full KV cache to f16 scratch on every call, so prefer vec_f16 there.
+    const bool sm70_quantized_decode = cc >= CC_VOLTA && cc < CC_TURING && Q->ne[1] == 1 && precision == GGML_PREC_DEFAULT &&
+            (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_Q8_0) &&
+            K->type == V->type && K->ne[0] == 256 && ggml_is_quantized(K->type);
+    if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 &&
+        (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type) || sm70_quantized_decode)) {
+        if (sm70_quantized_decode) {
+            ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
+            return;
+        }
         ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
         return;
     }
@@ -162,8 +252,12 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
     }
 
+    if (is_pascal_hs512(cc, K, V)) {
+        return ggml_cuda_fattn_tile_new_is_supported(ctx, dst);
+    }
+
     if (!fast_fp16_available(cc)) {
-        if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+        if (Q->ne[1] <= 8) {
             return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
         } else {
             return ggml_cuda_fattn_tile_f32_is_supported(ctx, dst);
@@ -171,14 +265,22 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     }
 
     if (!fp16_mma_available(cc)) {
+        if (is_pascal_mla_absorbed_decode(Q, K, V)) {
+            return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+        }
         if (precision == GGML_PREC_DEFAULT) {
-            if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+            if (Q->ne[1] <= 8) {
+                if (cc == CC_PASCAL) {
+                    return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+                }
                 return ggml_cuda_fattn_vec_f16_is_supported(ctx, dst);
+            } else if (Q->ne[0] == 256) {
+                return ggml_cuda_fattn_tile_f32_is_supported(ctx, dst);
             } else {
                 return ggml_cuda_fattn_tile_f16_is_supported(ctx, dst);
             }
         } else {
-            if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+            if (Q->ne[1] <= 8) {
                 return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
             } else {
                 return ggml_cuda_fattn_tile_f32_is_supported(ctx, dst);
@@ -193,8 +295,13 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     //const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && cc < CC_ADA_LOVELACE && !mma_needs_data_conversion;
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && K->ne[0] == V->ne[0] && Q->ne[0] % (2*WARP_SIZE) == 0;
-    if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-        return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+    const bool sm70_quantized_decode = cc >= CC_VOLTA && cc < CC_TURING && Q->ne[1] == 1 && precision == GGML_PREC_DEFAULT &&
+            (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_Q8_0) &&
+            K->type == V->type && K->ne[0] == 256 && ggml_is_quantized(K->type);
+    if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 &&
+        (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type) || sm70_quantized_decode)) {
+        return sm70_quantized_decode ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
+                                      : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
     }
 
     if (new_mma_available(cc) &&

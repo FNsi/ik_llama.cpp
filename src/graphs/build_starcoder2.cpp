@@ -3,7 +3,7 @@
 #include "../llama-context.h"
 
 ggml_cgraph * llm_build_context::build_starcoder2() {
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+    ggml_cgraph * gf = new_graph_custom();
 
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
@@ -62,7 +62,10 @@ ggml_cgraph * llm_build_context::build_starcoder2() {
         cb(ffn_inp, "ffn_inp", il);
 
         // feed-forward network
-        cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+        cur = llm_build_norm(ctx0, ffn_inp, hparams, model.layers[il].ffn_norm, model.layers[il].ffn_norm_b, LLM_NORM, cb, il);
+        cb(cur, "ffn_norm", il);
+
+        cur = llm_build_ffn(ctx0, lctx, nullptr, cur,
                 model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   NULL,
                 NULL,                      NULL,                        NULL,
                 model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL,

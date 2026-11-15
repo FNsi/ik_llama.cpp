@@ -634,6 +634,9 @@ class GGUFWriter:
     def add_embedding_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.EMBEDDING_LENGTH.format(arch=self.arch), length)
 
+    def add_embedding_length_out(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.EMBEDDING_LENGTH_OUT.format(arch=self.arch), length)
+
     def add_features_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.FEATURES_LENGTH.format(arch=self.arch), length)
 
@@ -706,6 +709,12 @@ class GGUFWriter:
         else:
             self.add_array(Keys.Attention.HEAD_COUNT_KV.format(arch=self.arch), count)
 
+    def add_num_loops(self, n: int) -> None:
+        self.add_uint32(Keys.Nanbeige.NUM_LOOPS.format(arch=self.arch), n)
+
+    def add_skip_loop_final_norm(self, value: bool) -> None:
+        self.add_bool(Keys.Nanbeige.SKIP_LOOP_FINAL_NORM.format(arch=self.arch), value)
+
     def add_key_length(self, length: int) -> None:
         self.add_uint32(Keys.Attention.KEY_LENGTH.format(arch=self.arch), length)
 
@@ -730,6 +739,12 @@ class GGUFWriter:
     def add_sliding_window_pattern(self, value: Sequence[bool]) -> None:
         self.add_array(Keys.Attention.SLIDING_WINDOW_PATTERN.format(arch=self.arch), value)
 
+    def add_rope_pattern(self, value: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
+
+    def add_swiglu_clamp_exp(self, values: Sequence[float]) -> None:
+        self.add_array(Keys.LLM.SWIGLU_CLAMP_EXP.format(arch=self.arch), values)
+
     def add_dense_features_dims(self, dense:str, in_f:int, out_f:int) -> None:
         self.add_uint32(Keys.LLM.DENSE_FEAT_IN_SIZE.format(arch=self.arch, dense=dense), in_f)
         self.add_uint32(Keys.LLM.DENSE_FEAT_OUT_SIZE.format(arch=self.arch, dense=dense), out_f)
@@ -745,6 +760,18 @@ class GGUFWriter:
 
     def add_final_logit_softcapping(self, value: float) -> None:
         self.add_float32(Keys.LLM.FINAL_LOGIT_SOFTCAPPING.format(arch=self.arch), value)
+
+    def add_conv_kernel_size(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.CONV_KERNEL_SIZE.format(arch=self.arch), value)
+
+    def add_conv_group_size(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.CONV_GROUP_SIZE.format(arch=self.arch), value)
+
+    def add_selector_rank(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.SELECTOR_RANK.format(arch=self.arch), value)
+
+    def add_selector_top_k(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.SELECTOR_TOP_K.format(arch=self.arch), value)
 
     def add_expert_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_COUNT.format(arch=self.arch), count)
@@ -781,6 +808,21 @@ class GGUFWriter:
 
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
+
+    def add_attention_indexer_head_count(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_HEAD_COUNT.format(arch=self.arch), count)
+
+    def add_attention_indexer_key_length(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_KEY_LENGTH.format(arch=self.arch), length)
+
+    def add_attention_indexer_top_k(self, top_k: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_TOP_K.format(arch=self.arch), top_k)
+
+    def add_attention_indexer_block_size(self, size: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_BLOCK_SIZE.format(arch=self.arch), size)
+
+    def add_attention_indexer_local_blocks(self, blocks: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_LOCAL_BLOCKS.format(arch=self.arch), blocks)
 
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
@@ -851,6 +893,9 @@ class GGUFWriter:
     def add_attention_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
 
+    def add_attention_value_scale(self, value: float) -> None:
+        self.add_float32(Keys.Attention.VALUE_SCALE.format(arch=self.arch), value)
+
     def add_attn_output_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.OUTPUT_SCALE.format(arch=self.arch), value)
 
@@ -866,11 +911,17 @@ class GGUFWriter:
     def add_rope_dimension_count(self, count: int) -> None:
         self.add_uint32(Keys.Rope.DIMENSION_COUNT.format(arch=self.arch), count)
 
+    def add_rope_dimension_count_swa(self, count: int) -> None:
+        self.add_uint32(Keys.Rope.DIMENSION_COUNT_SWA.format(arch=self.arch), count)
+
     def add_rope_dimension_sections(self, dims: Sequence[int]) -> None:
         self.add_array(Keys.Rope.DIMENSION_SECTIONS.format(arch=self.arch), dims)
 
     def add_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Rope.FREQ_BASE.format(arch=self.arch), value)
+
+    def add_rope_freq_base_swa(self, value: float) -> None:
+        self.add_float32(Keys.Rope.FREQ_BASE_SWA.format(arch=self.arch), value)
 
     def add_rope_scaling_type(self, value: RopeScalingType) -> None:
         self.add_string(Keys.Rope.SCALING_TYPE.format(arch=self.arch), value.value)
@@ -919,6 +970,33 @@ class GGUFWriter:
 
     def add_ssm_dt_b_c_rms(self, value: bool) -> None:
         self.add_bool(Keys.SSM.DT_B_C_RMS.format(arch=self.arch), value)
+
+    def add_kda_head_dim(self, value: int) -> None:
+        self.add_uint32(f"{self.arch}.kda.head_dim", value)
+
+    def add_kda_gate_lower_bound(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.kda.gate_lower_bound", value)
+
+    def add_latent_norm_rms_eps(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.attention.latent_norm_rms_epsilon", value)
+
+    def add_activation_situ_beta(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.activation.situ_beta", value)
+
+    def add_activation_situ_linear_beta(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.activation.situ_linear_beta", value)
+
+    def add_hyper_connection_count(self, value: int) -> None:
+        self.add_uint32(f"{self.arch}.hyper_connection.count", value)
+
+    def add_hyper_connection_epsilon(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.hyper_connection.epsilon", value)
+
+    def add_hyper_connection_sinkhorn_iterations(self, value: int) -> None:
+        self.add_uint32(f"{self.arch}.hyper_connection.sinkhorn_iterations", value)
+
+    def add_hyper_connection_magnitude(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.hyper_connection.magnitude", value)
 
     def add_tokenizer_model(self, model: str) -> None:
         self.add_string(Keys.Tokenizer.MODEL, model)

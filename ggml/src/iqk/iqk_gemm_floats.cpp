@@ -352,7 +352,7 @@ static void mul_mat_bf16_r16_bf16(int n, const void * vx, size_t bx, const DataI
             static_for<nrc_y>([&](const int iy) {
                 auto y128 = _mm_loadu_si128((const __m128i*)y[iy]+ib);
                 //auto y = _mm512_broadcast_i32x4(y128);
-                auto y256 = MM256_SET_M128I(y128, y128);
+                auto y256 = MM256_SET1_M128I(y128);
                 auto y = _mm512_inserti32x8(_mm512_castsi256_si512(y256), y256, 1);
                 acc[2*iy+0] = _mm512_dpbf16_ps(acc[2*iy+0], qx[0], (__m512bh)_mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x00)));
                 acc[2*iy+0] = _mm512_dpbf16_ps(acc[2*iy+0], qx[1], (__m512bh)_mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x55)));
@@ -380,7 +380,7 @@ static void mul_mat_bf16_r16_bf16(int n, const void * vx, size_t bx, const DataI
             qx[3] = (__m512bh)_mm512_loadu_si512((const __m512i *)b8+4*ib+3);
             static_for<nrc_y>([&](const int iy) {
                 auto y128 = _mm_loadu_si128((const __m128i*)y[iy]+ib);
-                auto y256 = MM256_SET_M128I(y128, y128);
+                auto y256 = MM256_SET1_M128I(y128);
                 auto y = _mm512_inserti32x8(_mm512_castsi256_si512(y256), y256, 1);
                 acc[iy] = _mm512_dpbf16_ps(acc[iy], qx[0], (__m512bh)_mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x00)));
                 acc[iy] = _mm512_dpbf16_ps(acc[iy], qx[1], (__m512bh)_mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x55)));
@@ -608,7 +608,7 @@ void set_mul_mat_bf16_r16(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
 bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels) {
 
     if (typeA == GGML_TYPE_BF16) {
-        if (ne00 % 8) return false;
+        if (ne00 % 8 || ne00 < QFBase::k_step) return false;
         switch (typeB) {
 #ifdef __AVX512BF16__
             case GGML_TYPE_BF16: {
@@ -639,7 +639,7 @@ bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t,
     }
 
     if (typeA == GGML_TYPE_F16 || typeA == GGML_TYPE_F32) {
-        if (ne00 % 4) return false;
+        if (ne00 % 4 || ne00 < QFBase::k_step) return false;
     }
     if (typeA == GGML_TYPE_F16) {
         switch (typeB) {

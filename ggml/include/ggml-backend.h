@@ -42,6 +42,7 @@ extern "C" {
     GGML_API           size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
     GGML_API           void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API           bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
+    GGML_API GGML_CALL bool                           ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer);
     GGML_API           void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API           enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API           ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
@@ -102,6 +103,8 @@ extern "C" {
 
     GGML_API GGML_CALL bool ggml_backend_is_cpu                (ggml_backend_t backend);
     GGML_API           void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
+    GGML_API           void ggml_backend_cpu_set_moe_expert_prefetch(ggml_backend_t backend_cpu, bool enable);
+    GGML_API           void ggml_backend_cpu_set_cpu_affinity  (ggml_backend_t backend_cpu, const int32_t * cpus, int n_cpus);
     GGML_API           void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     // Create a backend buffer from an existing pointer
@@ -175,7 +178,16 @@ extern "C" {
     // when ask == false, the scheduler is passing the node tensor to the user for observation
     // if the user returns false, the scheduler will cancel the graph compute
     //
-    typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+    typedef int (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+
+    enum ggml_backend_sched_copy_phase {
+        GGML_BACKEND_SCHED_COPY_PHASE_QUERY,
+        GGML_BACKEND_SCHED_COPY_PHASE_EXECUTE,
+    };
+
+    typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend,
+            const struct ggml_tensor * src, struct ggml_tensor * dst,
+            struct ggml_cgraph * graph, enum ggml_backend_sched_copy_phase phase, void * user_data);
 
     // Initialize a backend scheduler
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel);
@@ -208,12 +220,19 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_copy_callback(
+            ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
     // enable or disable op offload for a given op
     GGML_API void                 ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);
     GGML_API void                 ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extra_alloc_MiB);
+
+    // prefetch mmap'd MoE expert weights into the page cache
+    GGML_API bool                 ggml_backend_prefetch_init(int n_threads);
+    GGML_API void                 ggml_backend_prefetch_register_mapping(const void * addr, size_t size);
+    GGML_API void                 ggml_backend_prefetch_unregister_mapping(const void * addr);
 
     //
     // Utils

@@ -278,10 +278,15 @@ struct mtmd_context {
             // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
             img_end = "[IMG_END]";
 
-        } else if (proj == PROJECTOR_TYPE_QWEN2VL || proj == PROJECTOR_TYPE_QWEN25VL || proj == PROJECTOR_TYPE_QWEN3VL) {
+        } else if (proj == PROJECTOR_TYPE_QWEN2VL || proj == PROJECTOR_TYPE_QWEN25VL || proj == PROJECTOR_TYPE_QWEN3VL || proj == PROJECTOR_TYPE_LING3VL) {
             // <|vision_start|> ... (image embeddings) ... <|vision_end|>
             img_beg = "<|vision_start|>";
             img_end = "<|vision_end|>";
+
+        } else if (proj == PROJECTOR_TYPE_MINIMAX_M3_VL) {
+            // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
+            img_beg = "]<]start of image[>[";
+            img_end = "]<]end of image[>[";
 
         } else if (proj == PROJECTOR_TYPE_LLAMA4) {
             // (more details in mtmd_context constructor)
@@ -301,11 +306,29 @@ struct mtmd_context {
             img_end = "<|im_end|>";
 
         }
-        else if (proj == PROJECTOR_TYPE_GEMMA4V) {
+        else if (proj == PROJECTOR_TYPE_GEMMA4V || proj == PROJECTOR_TYPE_GEMMA4UV) {
             // <|image> ... (image embeddings) ... <image|>
             img_beg = "<|image>";
             img_end = "<image|>";
             //image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+        }
+        else if (proj == PROJECTOR_TYPE_KIMIK25) {
+            // GLM-5.2-V reuses the Kimi-K2.5 vision encoder and projector, but marks
+            // images with its own tokens, so decide based on the text model vocab
+            if (lookup_token("<|begin_of_image|>") != LLAMA_TOKEN_NULL) {
+                // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+                img_beg = "<|begin_of_image|>";
+                img_end = "<|end_of_image|>";
+            } else {
+                // template renders: <|media_begin|>image<|media_content|> <pad/embeddings> <|media_end|>
+                img_beg = "<|media_begin|>image<|media_content|>";
+                img_end = "<|media_end|>";
+            }
+        }
+        else if (proj == PROJECTOR_TYPE_DEEPSEEK4V || proj == PROJECTOR_TYPE_DEEPSEEK41) {
+            // markers are learned embeddings emitted by the encoder graph
+            img_beg = "";
+            img_end = "";
         }
     }
 
@@ -321,7 +344,12 @@ struct mtmd_context {
         LOG_WRN("%s: audio input is in experimental stage and may have reduced quality:\n"
                 "    https://github.com/ggml-org/llama.cpp/discussions/13759\n", __func__);
 
-        if (proj == PROJECTOR_TYPE_QWEN2A) {
+        if (proj == PROJECTOR_TYPE_GEMMA4UA) {
+            // <|audio> ... (embeddings) ... <audio|>
+            aud_beg = "<|audio>";
+            aud_end = "<audio|>";
+
+        } else if (proj == PROJECTOR_TYPE_QWEN2A) {
             // <|audio_bos|> ... (embeddings) ... <|audio_eos|>
             aud_beg = "<|audio_bos|>";
             aud_end = "<|audio_eos|>";
@@ -398,6 +426,25 @@ void mtmd_free(mtmd_context * ctx) {
     delete ctx;
 }
 
+int32_t mtmd_get_memory_usage(const mtmd_context * ctx, struct llama_memory_buft * usage, int32_t n_max) {
+    int32_t n = 0;
+    const clip_ctx * clips[2] = { ctx->ctx_v, ctx->ctx_a };
+    for (int i = 0; i < 2; ++i) {
+        if (!clips[i]) {
+            continue;
+        }
+        const std::vector<std::pair<ggml_backend_buffer_type_t, size_t>> clip_usage = clip_get_mem_usage(clips[i]);
+        for (size_t j = 0; j < clip_usage.size(); ++j) {
+            if (n < n_max) {
+                usage[n].buft = clip_usage[j].first;
+                usage[n].size = clip_usage[j].second;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
 struct mtmd_tokenizer {
     mtmd_context * ctx;
     std::vector<const mtmd_bitmap *> bitmaps;
@@ -415,7 +462,7 @@ struct mtmd_tokenizer {
             size_t n_bitmaps) : ctx(ctx), bitmaps(bitmaps, bitmaps + n_bitmaps) {
         add_special   = text->add_special;
         parse_special = text->parse_special;
-        input_text    = text->text;
+        input_text.assign(text->text, text->text_len);
         vocab         = llama_model_get_vocab(ctx->text_model);
 
         // for compatibility, we convert image marker to media marker
@@ -425,19 +472,32 @@ struct mtmd_tokenizer {
     int32_t tokenize(mtmd_input_chunks * output) {
         cur.entries.clear();
         std::vector<std::string> parts = split_text(input_text, ctx->media_marker);
+
+        size_t n_markers = 0;
+        for (const auto & part : parts) {
+            if (part == ctx->media_marker) {
+                n_markers++;
+            }
+        }
+
+        if (n_markers > bitmaps.size()) {
+            LOG_WRN("%s: prompt has %zu more media marker(s) than bitmap(s), "
+                    "the unmatched marker(s) will be treated as literal text\n",
+                    __func__, n_markers - bitmaps.size());
+        }
+
         size_t i_bm = 0; // index of the current bitmap
         for (auto & part : parts) {
             if (part == ctx->media_marker) {
-                // this is a marker, we should add the next bitmap
-                if (i_bm >= bitmaps.size()) {
-                    LOG_ERR("%s: error: number of bitmaps (%zu) does not match number of markers (%zu)\n",
-                            __func__, bitmaps.size(), parts.size() - 1);
-                    return 1;
-                }
-                const mtmd_bitmap * bitmap = bitmaps[i_bm++];
-                int32_t res = add_media(bitmap);
-                if (res != 0) {
-                    return res;
+                if (i_bm < bitmaps.size()) {
+                    // this is a marker, we should add the next bitmap
+                    const mtmd_bitmap * bitmap = bitmaps[i_bm++];
+                    int32_t res = add_media(bitmap);
+                    if (res != 0) {
+                        return res;
+                    }
+                } else {
+                    add_text(part, parse_special);
                 }
             } else {
                 // this is a text part, we should add it as text
@@ -469,8 +529,8 @@ struct mtmd_tokenizer {
         }
 
         if (i_bm != bitmaps.size()) {
-            LOG_ERR("%s: error: number of bitmaps (%zu) does not match number of markers (%zu)\n",
-                    __func__, bitmaps.size(), parts.size() - 1);
+            LOG_ERR("%s: error: number of bitmaps (%zu) does not match number of media markers (%zu)\n",
+                    __func__, bitmaps.size(), n_markers);
             return 1;
         }
 
@@ -568,7 +628,7 @@ struct mtmd_tokenizer {
                             if (!ctx->tok_sli_img_start.empty()) {
                                 add_text(ctx->tok_sli_img_start);
                             } else if (!ctx->sli_img_start_tmpl.empty()) {
-                                // If using a template to preceed a slice image
+                                // If using a template to precede a slice image
                                 const size_t sz = std::snprintf(nullptr, 0, ctx->sli_img_start_tmpl.c_str(), y+1, x+1) + 1;
                                 std::unique_ptr<char[]> buf(new char[sz]);
                                 std::snprintf(buf.get(), sz, ctx->sli_img_start_tmpl.c_str(), y+1, x+1);
@@ -595,6 +655,15 @@ struct mtmd_tokenizer {
                 }
 
             } else {
+                if (ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK4V) {
+                    // align the image block to the 4-token CSA compress boundary
+                    constexpr int32_t align = 4;
+                    size_t n_past = 0;
+                    for (const auto & e : cur.entries) {
+                        n_past += mtmd_input_chunk_get_n_tokens(&e);
+                    }
+                    batch_f32.entries[0]->lead_pad = align - 1 - (int32_t)(n_past % align);
+                }
                 size_t n_tokens = 0;
                 for (const auto & entry : batch_f32.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
@@ -649,14 +718,20 @@ struct mtmd_tokenizer {
             }
 
             // preprocess audio
-            GGML_ASSERT(ctx->w_filters.n_mel); // make sure we have filter preloaded
             std::vector<whisper_preprocessor::whisper_mel> mel_spec_chunks;
             const float * samples = (const float *)bitmap->data.data();
             size_t n_samples = bitmap->data.size() / sizeof(float);
-            bool ok = whisper_preprocessor::preprocess_audio(samples, n_samples, ctx->w_filters, mel_spec_chunks);
-            if (!ok) {
-                LOG_ERR("Unable to preprocess audio\n");
-                return 2;
+            if (clip_get_projector_type(ctx->ctx_a) == PROJECTOR_TYPE_GEMMA4UA) {
+                // raw frames, no mel
+                const int frame_size = clip_get_audio_n_mel(ctx->ctx_a);
+                mel_spec_chunks.push_back(whisper_preprocessor::preprocess_audio_raw_frames(samples, n_samples, frame_size));
+            } else {
+                GGML_ASSERT(ctx->w_filters.n_mel); // make sure we have filter preloaded
+                bool ok = whisper_preprocessor::preprocess_audio(samples, n_samples, ctx->w_filters, mel_spec_chunks);
+                if (!ok) {
+                    LOG_ERR("Unable to preprocess audio\n");
+                    return 2;
+                }
             }
 
             // consider each mel_spec as a separate audio chunk
@@ -778,12 +853,20 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
             LOG_ERR("%s: model does not support vision input\n", __func__);
             return 1;
         }
+        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
+        // chunk->tokens_image will have been cleared out to save memory
+        GGML_ASSERT(!chunk->tokens_image->batch_f32.entries.empty()
+            && "mtmd_encode_chunk: image data already released (double encode?)");
         return mtmd_encode(ctx, chunk->tokens_image.get());
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         if (!ctx->ctx_a) {
             LOG_ERR("%s: model does not support audio input\n", __func__);
             return 1;
         }
+        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
+        // chunk->tokens_audio will have been cleared out to save memory
+        GGML_ASSERT(!chunk->tokens_audio->batch_f32.entries.empty()
+            && "mtmd_encode_chunk: audio data already released (double encode?)");
         int n_mmproj_embd = ctx->n_embd_text;
         ctx->image_embd_v.resize(chunk->tokens_audio->n_tokens * n_mmproj_embd);
         bool ok = clip_image_batch_encode(
@@ -836,13 +919,27 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }
 
-bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
+int mtmd_get_image_max_tokens(const mtmd_context * ctx) {
+    return ctx->ctx_v ? clip_get_image_max_tokens(ctx->ctx_v) : 0;
+}
+
+void mtmd_set_image_max_tokens(mtmd_context * ctx, int n_tokens) {
     if (ctx->ctx_v) {
-        if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V) {
-            return true;
-        }
+        clip_set_image_max_tokens(ctx->ctx_v, n_tokens);
     }
-    return false;
+}
+
+bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
+    if (!ctx->ctx_v) {
+        return false;
+    }
+    const auto type = clip_get_projector_type(ctx->ctx_v);
+    if (type == PROJECTOR_TYPE_GEMMA4V) {
+        // E2B (1536) and E4B (2560) use causal attention
+        const int n_embd = clip_n_mmproj_embd(ctx->ctx_v);
+        return n_embd != 1536 && n_embd != 2560;
+    }
+    return type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4UV || type == PROJECTOR_TYPE_DEEPSEEK4V;
 }
 
 bool mtmd_decode_use_mrope(mtmd_context * ctx) {
@@ -1037,6 +1134,19 @@ void mtmd_input_chunk_free(mtmd_input_chunk * chunk) {
     }
 }
 
+void mtmd_input_chunk_free_raw_data(mtmd_input_chunk * chunk) {
+    if (!chunk) {
+        return;
+    }
+
+    if (chunk->tokens_image) {
+        chunk->tokens_image->batch_f32 = clip_image_f32_batch{};
+    }
+    if (chunk->tokens_audio) {
+        chunk->tokens_audio->batch_f32 = clip_image_f32_batch{};
+    }
+}
+
 // mtmd_image_tokens
 
 size_t mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens) {
@@ -1057,7 +1167,8 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
 
 llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     if (image_tokens->use_mrope_pos) {
-        return 1; // for M-RoPE, the whole image is 1 in temporal dimension
+        // next text pos after an M-RoPE image
+        return std::max(image_tokens->nx, image_tokens->ny);
     }
     return image_tokens->n_tokens();
 }
@@ -1109,63 +1220,10 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     return chunks;
 }
 
-static json mtmd_clip_image_f32_to_json(const clip_image_f32 & clip) {
-    json j;
-    j["nx"] = clip.nx;
-    j["ny"] = clip.ny;
-    j["buf"] = clip.buf;
-    return j;
-}
-
-static clip_image_f32 * mtmd_clip_image_f32_from_json(const json & j) {
-    clip_image_f32 * clip = new clip_image_f32;
-    clip->nx = j["nx"];
-    clip->ny = j["ny"];
-    clip->buf = j["buf"].get<std::vector<float>>();
-    return clip;
-}
-
-static json mtmd_clip_image_f32_batch_to_json(const clip_image_f32_batch & batch, bool full = false) {
-    json j;
-    j["is_audio"] = batch.is_audio;
-    j["grid_x"] = batch.grid_x;
-    j["grid_y"] = batch.grid_y;
-
-    if (full) {
-        std::vector<nlohmann::json> entries;
-        for (auto & entry : batch.entries) {
-            entries.push_back(mtmd_clip_image_f32_to_json(*entry));
-        }
-        j["entries"] = entries;
-    }
-
-    return j;
-}
-
-static clip_image_f32_batch mtmd_clip_image_f32_batch_from_json(const json & j, bool full = false) {
-    clip_image_f32_batch batch;
-    if (j.contains("is_audio")) {
-        batch.is_audio = j["is_audio"];
-        batch.grid_x = j["grid_x"];
-        batch.grid_y = j["grid_y"];
-        if (full) {
-            auto entries = j["entries"];
-            if (entries.is_array()) {
-                for (auto & entry : entries) {
-                    clip_image_f32 * clip = mtmd_clip_image_f32_from_json(entry);
-                    batch.entries.push_back(clip_image_f32_ptr(clip));
-                }
-            }
-        }
-
-    }
-    return batch;
-}
-
 static mtmd_audio_tokens mtmd_audio_tokens_from_json(json & j) {
     return mtmd_audio_tokens{
         j.value<uint32_t>("n_tokens", 0),
-        mtmd_clip_image_f32_batch_from_json(j.value("batch_f32", json{})),
+        clip_image_f32_batch {},
         j.value("id","")
     };
 }
@@ -1175,7 +1233,7 @@ static mtmd_image_tokens mtmd_image_tokens_from_json(json & j) {
         j.value<uint32_t>("nx", 0),
         j.value<uint32_t>("ny", 0),
         j.value("use_mrope_pos",false),
-        mtmd_clip_image_f32_batch_from_json(j.value("batch_f32", json{})),
+        clip_image_f32_batch {},
         j.value("id","")
     };
 }
@@ -1185,7 +1243,6 @@ static json mtmd_audio_tokens_to_json(mtmd_audio_tokens *  chunk) {
     if (chunk) {
         j["n_tokens"] = chunk->n_tokens;
         j["id"] = chunk->id;
-        j["batch_f32"] = mtmd_clip_image_f32_batch_to_json(chunk->batch_f32);
     }
     return j;
 }
@@ -1196,7 +1253,6 @@ static json mtmd_image_tokens_to_json(mtmd_image_tokens * chunk) {
         j["nx"] = chunk->nx;
         j["ny"] = chunk->ny;
         j["use_mrope_pos"] = chunk->use_mrope_pos;
-        j["batch_f32"] = mtmd_clip_image_f32_batch_to_json(chunk->batch_f32);
         j["id"] = chunk->id;
     }
     return j;
@@ -1233,7 +1289,6 @@ void mtmd_input_chunk_to_json(mtmd_input_chunk * chunk, json & j) {
         }
     }
 }
-
 
 
 

@@ -3,7 +3,7 @@
 #include "../llama-context.h"
 
 ggml_cgraph * llm_build_context::build_mamba() {
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+    ggml_cgraph * gf = new_graph_custom();
 
     const int64_t d_model = n_embd;
     const int64_t d_conv  = hparams.ssm_d_conv;
@@ -55,7 +55,7 @@ ggml_cgraph * llm_build_context::build_mamba() {
             // Custom operator which is needed only to ease simultaneous sequence processing.
             // For a single sequence, the equivalent is to concatenate the columns of conv_states and x,
             // then make a self-overlapping view of that over d_conv columns at each stride in the 3rd dimension,
-            // then element-wise multiply that with the conv1d weigth,
+            // then element-wise multiply that with the conv1d weight,
             // then sum the elements of each row,
             // (the last two steps are a dot product over rows (also doable with mul_mat))
             // then permute away the ne[0] dimension,

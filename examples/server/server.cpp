@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "server-common.h"
 #include "server-chat.h"
+#include "server-cors-proxy.h"
 #include "chat.h"
 
 #include "common.h"
@@ -15,6 +16,25 @@
 
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
+
+// Tee llama/ggml log output to --log-file (when set) and stderr. Gated on
+// log_target_changed() so it's a no-op unless --log-file was passed (LOG_TARGET
+// is non-null by default). The stdout/stderr guard mirrors LOG_TEE_IMPL and
+// avoids doubled output when fopen() falls back to stderr.
+static void llama_log_tee_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (text == nullptr) {
+        return;
+    }
+    if (log_target_changed()) {
+        FILE * tgt = LOG_TARGET;
+        if (tgt != nullptr && tgt != stdout && tgt != stderr) {
+            fprintf(tgt, "%s", text);
+            fflush(tgt);
+        }
+    }
+    fputs(text, stderr);
+    fflush(stderr);
+}
 
 
 #ifndef NDEBUG
@@ -329,6 +349,18 @@ struct server_response_reader {
         return !cancelled && received_count < id_tasks.size();
     }
 
+    // cancel-cascade fix: true only if one of THIS reader's tasks is on a
+    // slot (the active decode). Used to gate llama_decode_stop() so a queued/
+    // deferred task's disconnect cannot abort another task's active decode via
+    // the process-global stop_internal_decode flag. Best-effort cross-thread
+    // read (slots are not resized at runtime; same race class as the global).
+    bool any_task_on_slot() const {
+        for (const auto & slot : ctx_server.slots) {
+            if (slot.is_processing() && id_tasks.count(slot.id_task)) return true;
+        }
+        return false;
+    }
+
     // return nullptr if should_stop() is true before receiving a result
     // note: if one error is received, it will stop further processing and return error result
     server_task_result_ptr next(const std::function<bool()>& should_stop) {
@@ -414,7 +446,7 @@ auto res_err = [](httplib::Response& res, json error_data) {
 };
 
 auto res_ok = [](httplib::Response& res, const json& data) {
-    res.set_content(data.dump(), "application/json; charset=utf-8");
+    res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     res.status = 200;
 };
 
@@ -438,6 +470,41 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
     }
 }
 
+static std::string render_memory_metrics(const json & memory_data) {
+    static const char * keys[] = { "model", "context", "compute", "mmproj", "total", "free" };
+    static const char * helps[] = {
+        "Memory allocated for the model weights, in bytes.",
+        "Memory allocated for the KV cache, in bytes.",
+        "Memory allocated for compute buffers, in bytes.",
+        "Memory allocated for the multimodal projector, in bytes.",
+        "Total memory of the device, in bytes.",
+        "Free memory of the device, in bytes.",
+    };
+
+    std::stringstream prometheus;
+    for (int k = 0; k < 6; ++k) {
+        const std::string name = std::string("memory_") + keys[k] + "_bytes";
+        bool described = false;
+        for (size_t i = 0; i < memory_data.size(); ++i) {
+            const json & entry = memory_data[i];
+            if (!entry.contains(keys[k])) {
+                continue;
+            }
+            if (!described) {
+                prometheus << "# HELP llamacpp:" << name << " " << helps[k] << "\n"
+                           << "# TYPE llamacpp:" << name << " gauge\n";
+                described = true;
+            }
+            std::string device = entry.at("name").get<std::string>();
+            string_replace_all(device, "\\", "\\\\");
+            string_replace_all(device, "\"", "\\\"");
+            string_replace_all(device, "\n", "\\n");
+            prometheus << "llamacpp:" << name << "{device=\"" << device << "\"} " << entry.at(keys[k]).dump() << "\n";
+        }
+    }
+    return prometheus.str();
+}
+
 int main(int argc, char ** argv) {
 #if SERVER_VERBOSE != 1
     log_disable();
@@ -452,6 +519,23 @@ int main(int argc, char ** argv) {
 
     // parse arguments from environment variables
     gpt_params_parse_from_env(params);
+
+    // Tee llama/ggml logs to --log-file; installed before model load so that
+    // load-time logs are captured too.
+    llama_log_set(llama_log_tee_callback, nullptr);
+
+    // Route common_log (SLT_*/SRV_*/QUE_*/RES_*/bare LOG_* slot+queue output) to
+    // --log-file via its native file sink. The worker tees to stderr and file
+    // (common/log.cpp), so this captures every common_log line in one call
+    // instead of mirroring each macro. Share LOG_TARGET's already-opened FILE*
+    // so there's a single handle on the file (a second fopen would truncate and
+    // the two handles' writes would corrupt each other).
+    if (log_target_changed()) {
+        FILE * tgt = LOG_TARGET;
+        if (tgt != nullptr && tgt != stdout && tgt != stderr) {
+            common_log_set_file_ptr(common_log_main(), tgt);
+        }
+    }
 
     // TODO: not great to use extern vars
     server_log_json = params.log_json;
@@ -572,7 +656,7 @@ int main(int argc, char ** argv) {
             sqlite3_free(errmsg);
             LOG_WARNING("Failed to load extension", {{"err", err}});
         }
-	else {
+        else {
             sqlite_extension_loaded = true;
         }
         sqlite3_enable_load_extension(conn, 0);
@@ -750,6 +834,25 @@ int main(int argc, char ** argv) {
                     }
 
                     res.set_content(health.dump(), "application/json");
+
+                    const char * hotswap_env = std::getenv("LLAMA_HOTSWAP_ENABLED");
+                    if (hotswap_env) {
+                        // WARNING: llama_reload_changed_tensors is NOT thread-safe with active inference.
+                        // Best effort: only attempt the reload when no slot is processing (a request
+                        // arriving between the metrics snapshot and the reload can still race it).
+                        if (n_processing_slots > 0) {
+                            LOG_INFO("hotswap: skipping tensor reload, slots are processing", {{"processing", n_processing_slots}});
+                        } else if (llama_reload_changed_tensors(ctx_server.ctx)) {
+                            // KV cache entries and cached prompts were computed with the
+                            // previous weights; drop them so they cannot be reused.
+                            ctx_server.kv_cache_clear();
+                            for (auto & slot : ctx_server.slots) {
+                                slot.cache_tokens.clear();
+                            }
+                            LOG_INFO("hotswap: tensors reloaded; KV cache and cached prompts cleared", {});
+                        }
+                    }
+
                     break;
                 }
             case SERVER_STATE_LOADING_MODEL:
@@ -799,6 +902,7 @@ int main(int argc, char ** argv) {
         task.id_multi  = -1;
         task.id_target = -1;
         task.type = SERVER_TASK_TYPE_METRICS;
+        task.metrics_memory = true;
         task.data.push_back({{"reset_bucket", true}});
 
         ctx_server.queue_results.add_waiting_task_id(task.id);
@@ -881,11 +985,39 @@ int main(int argc, char ** argv) {
             }
         }
 
+        prometheus << render_memory_metrics(data.at("memory"));
+
         const int64_t t_start = data.at("t_start");
         res.set_header("Process-Start-Time-Unix", std::to_string(t_start));
 
         res.set_content(prometheus.str(), "text/plain; version=0.0.4");
         res.status = 200; // HTTP OK
+    };
+
+    const auto handle_memory = [&](const httplib::Request &, httplib::Response & res) {
+        if (!params.endpoint_memory) {
+            res_err(res, format_error_response("This server does not support memory endpoint. Start it with `--memory`", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+
+        server_task task;
+        task.id = ctx_server.queue_tasks.get_new_id();
+        task.id_multi  = -1;
+        task.id_target = -1;
+        task.type = SERVER_TASK_TYPE_METRICS;
+        task.metrics_memory = true;
+
+        ctx_server.queue_results.add_waiting_task_id(task.id);
+        ctx_server.queue_tasks.post(std::move(task));
+
+        server_task_result result = ctx_server.queue_results.recv(task.id);
+        ctx_server.queue_results.remove_waiting_task_id(task.id);
+
+        res.set_content(json {
+            { "n_layer", result.data.at("n_layer") },
+            { "data",    result.data.at("memory")  },
+        }.dump(), "application/json");
+        res.status = 200;
     };
 
     const auto handle_slots_save = [&ctx_server, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
@@ -1020,7 +1152,8 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
-            { "n_ctx",                       ctx_server.n_ctx }
+            { "n_ctx",                       ctx_server.n_ctx },
+            { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
 
         };
 
@@ -1125,7 +1258,7 @@ int main(int argc, char ** argv) {
                 // non-stream, wait for the results
                 auto all_results = rd->wait_for_all(is_connection_closed);
                 if (all_results.is_terminated) {
-                    llama_decode_stop(); // send a signal to stop decode process
+                    if (rd->any_task_on_slot()) llama_decode_stop(); // cancel-cascade fix: stop only if OUR task is the active decode
                     return; // connection is closed
                 }
                 else if (all_results.error) {
@@ -1139,8 +1272,8 @@ int main(int argc, char ** argv) {
                         arr.push_back(res->to_json());
                     }
                     // if single request, return single object instead of array
-                    res_ok(res, arr.size() == 1 ? arr[0] : arr);              
-                }                       
+                    res_ok(res, arr.size() == 1 ? arr[0] : arr);
+                }
             }
             else {
                 // in streaming mode, the first error must be treated as non-stream response
@@ -1148,7 +1281,7 @@ int main(int argc, char ** argv) {
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
                 server_task_result_ptr first_result = rd->next(is_connection_closed);
                 if (first_result == nullptr) {
-                    llama_decode_stop(); // send a signal to stop decode process
+                    if (rd->any_task_on_slot()) llama_decode_stop(); // cancel-cascade fix: stop only if OUR task is the active decode
                     return; // connection is closed
                 }
                 else if (first_result->is_error()) {
@@ -1182,6 +1315,16 @@ int main(int argc, char ** argv) {
                             return false; // sending failed, go to on_complete()
                         }
                         first_result_json.clear(); // mark as sent
+                        // the first result can already be the final one, e.g. when the whole
+                        // generation is an incomplete UTF-8 character that was never sent
+                        if (!rd->has_next()) {
+                            if (oaicompat != OAICOMPAT_TYPE_ANTHROPIC && oaicompat != OAICOMPAT_TYPE_NONE && oaicompat != OAICOMPAT_TYPE_RESP) {
+                                static const std::string ev_done = "data: [DONE]\n\n";
+                                sink.write(ev_done.data(), ev_done.size());
+                            }
+                            sink.done();
+                            return false; // no more data, go to on_complete()
+                        }
                     }
 
                     // receive subsequent results
@@ -1261,6 +1404,48 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_models = [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
+        json codex_model = {
+            {"slug", params.model_alias},
+            {"display_name", params.model_alias},
+            {"description", nullptr},
+            {"default_reasoning_level", nullptr},
+            {"supported_reasoning_levels", json::array()},
+            {"shell_type", "default"},
+            {"visibility", "list"},
+            {"supported_in_api", true},
+            {"priority", 0},
+            {"additional_speed_tiers", json::array()},
+            {"service_tiers", json::array()},
+            {"default_service_tier", nullptr},
+            {"availability_nux", nullptr},
+            {"upgrade", nullptr},
+            {"base_instructions", ""},
+            {"model_messages", nullptr},
+            {"supports_reasoning_summaries", false},
+            {"default_reasoning_summary", "auto"},
+            {"support_verbosity", false},
+            {"default_verbosity", nullptr},
+            {"apply_patch_tool_type", nullptr},
+            {"web_search_tool_type", "text"},
+            {"truncation_policy", {
+                {"mode", "tokens"},
+                {"limit", params.n_ctx},
+            }},
+            {"supports_parallel_tool_calls", false},
+            {"supports_image_detail_original", false},
+            {"context_window", params.n_ctx},
+            {"max_context_window", params.n_ctx},
+            {"auto_compact_token_limit", (params.n_ctx * 9) / 10},
+            {"effective_context_window_percent", 95},
+            {"experimental_supported_tools", json::array()},
+            {"input_modalities", json::array({"text"})},
+            {"supports_search_tool", false},
+            {"use_responses_lite", false},
+            {"auto_review_model_override", nullptr},
+            {"tool_mode", nullptr},
+            {"multi_agent_version", nullptr},
+        };
+
         json models = {
             {"object", "list"},
             {"data", {
@@ -1272,7 +1457,8 @@ int main(int argc, char ** argv) {
                      {"meta",     model_meta},
                      {"max_model_len", params.n_ctx}, //vllm specs
                  },
-             }}
+             }},
+            {"models", json::array({codex_model})},
         };
 
         res.set_content(models.dump(), "application/json; charset=utf-8");
@@ -1356,10 +1542,11 @@ int main(int argc, char ** argv) {
     const auto handle_infill = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         json data = json::parse(req.body);
-        const int id_task = ctx_server.queue_tasks.get_new_id();
-        server_tokens token; // dummy tokens
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-        ctx_server.request_completion(id_task, -1, data, true, false, std::move(token));
+        //avoid double submits
+        //const int id_task = ctx_server.queue_tasks.get_new_id();
+        //server_tokens token; // dummy tokens
+        //ctx_server.queue_results.add_waiting_task_id(id_task);
+        //ctx_server.request_completion(id_task, -1, data, true, false, token);
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_INFILL,
@@ -1392,7 +1579,7 @@ int main(int argc, char ** argv) {
         }
 
         const json data = format_detokenized_response(content);
-        return res.set_content(data.dump(), "application/json; charset=utf-8");
+        return res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
     const auto handle_embeddings_impl = [&ctx_server](const httplib::Request& req, httplib::Response& res, oaicompat_type oaicompat) {
@@ -1477,7 +1664,7 @@ int main(int argc, char ** argv) {
 
         // collect results
         if (all_results.is_terminated) {
-            llama_decode_stop();
+            if (rd.any_task_on_slot()) llama_decode_stop(); // cancel-cascade fix: stop only if OUR task is the active decode
             return; // connection is closed
         }
         else if (all_results.error) {
@@ -1509,6 +1696,79 @@ int main(int argc, char ** argv) {
         handle_embeddings_impl(req, res, OAICOMPAT_TYPE_EMBEDDING);
     };
 
+    const auto handle_systemone = [&ctx_server, &params](const httplib::Request & req, httplib::Response & res) {
+        const auto & decision = ctx_server.decision;
+        if (decision.type == COMMON_DECISION_TYPE_NONE) {
+            res_err(res, format_error_response("This model is not a decision model", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+
+        const json body = json::parse(req.body);
+        std::vector<server_decision_question> questions;
+        size_t n_images = 0;
+        try {
+            questions = decision.parse_questions(body);
+            n_images  = decision.count_images(body);
+        } catch (const std::invalid_argument & e) {
+            res_err(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (n_images > 0) {
+            res_err(res, format_error_response("This server does not support image input for decisions", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+        const json & state = body.at("state");
+
+        // one task per variant of each question
+        server_response_reader rd(ctx_server);
+        {
+            std::vector<server_task> tasks;
+            for (const auto & question : questions) {
+                for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
+                    server_task task = server_task(SERVER_TASK_TYPE_DECISION);
+                    task.id = ctx_server.queue_tasks.get_new_id();
+                    task.index = tasks.size();
+                    decision.fill_task(state, questions, question, variant, task);
+                    tasks.push_back(std::move(task));
+                }
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.is_connection_closed);
+
+        if (all_results.is_terminated) {
+            if (rd.any_task_on_slot()) llama_decode_stop();
+            return; // connection is closed
+        }
+        else if (all_results.error) {
+            res_err(res, all_results.error->to_json());
+            return;
+        }
+
+        json answers = json::object();
+        int32_t n_tokens = 0;
+        size_t i_result = 0;
+        for (const auto & question : questions) {
+            std::vector<std::vector<float>> scores;
+            for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
+                auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[i_result++].get());
+                GGML_ASSERT(result != nullptr);
+                scores.push_back(result->scores);
+                n_tokens += result->n_tokens;
+            }
+            answers[question.id] = decision.format_answer(question, scores);
+        }
+
+        res_ok(res, json{
+            {"model",   params.model_alias},
+            {"answers", answers},
+            {"usage",   {
+                {"input_tokens",  n_tokens},
+                {"output_tokens", 0},
+            }},
+        });
+    };
 
     const auto handle_lora_adapters_list = [&](const httplib::Request & req, httplib::Response & res) {
         json result = json::array();
@@ -1862,7 +2122,7 @@ int main(int argc, char ** argv) {
     auto db_handler = [db_handle](auto func) {
         return [func, db_handle](const httplib::Request& req, httplib::Response& res) {
             res.set_header("Access-Control-Allow-Origin", "*");
-	    try {
+            try {
                 const json body = !req.body.empty() ? json::parse(req.body) : json::object();
                 func(*db_handle, body, req, res);
             } catch(const std::exception& e) {
@@ -1909,14 +2169,14 @@ int main(int argc, char ** argv) {
 
     const auto handle_load = db_handler([normalize_store_name, get_key_string](auto& db, const json& body, auto&, auto& res) {
         std::string data;
-	const std::string store = normalize_store_name(body["storeName"]);
-	db.db << "SELECT data FROM " + store + " WHERE key = ?" << get_key_string(body["key"]) >> data;
-	if(data.empty()) {
+        const std::string store = normalize_store_name(body["storeName"]);
+        db.db << "SELECT data FROM " + store + " WHERE key = ?" << get_key_string(body["key"]) >> data;
+        if(data.empty()) {
             res.status = 404;
             res.set_content(json{{"ok", false}, {"message", "Key not found"}}.dump(), "application/json");
         } else {
             json response{{"ok", true}};
-	    response["result"] = (store == "names") ? json(data) : json::parse(data);
+            response["result"] = (store == "names") ? json(data) : json::parse(data);
             res.set_content(response.dump(), "application/json");
         }
     });
@@ -1977,7 +2237,7 @@ int main(int argc, char ** argv) {
         if (body["duration"].is_null()) {
             db.db << "select zstd_incremental_maintenance(?, ?)" <<  nullptr << body["db_load"].get<double>() >> data;
         }
-	else {
+        else {
             db.db << "select zstd_incremental_maintenance(?, ?)" << body["duration"].get<double>() << body["db_load"].get<double>() >> data;
         }
         json response{{"ok", true}};
@@ -2049,21 +2309,25 @@ int main(int argc, char ** argv) {
     // register API routes
     svr->Get ("/health",              handle_health);
     svr->Get ("/metrics",             handle_metrics);
+    svr->Get ("/memory",              handle_memory);
     svr->Get ("/props",               handle_props);
     svr->Get("/v1/props",             handle_props_simple);
     svr->Get ("/v1/models",           handle_models);
+    svr->Get ("/models",              handle_models);
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions", handle_completions); // legacy
     svr->Post("/v1/completions",     handle_completions_oai);
     svr->Post("/chat/completions",    handle_chat_completions);
     svr->Post("/v1/chat/completions", handle_chat_completions);
     svr->Post("/v1/responses",        handle_responses);
+    svr->Post("/responses",           handle_responses);
     svr->Post("/v1/messages",         handle_anthropic_messages);
     svr->Post("/v1/messages/count_tokens", handle_anthropic_count_tokens);
     svr->Post("/infill",              handle_infill);
     svr->Post("/embedding",           handle_embeddings); // legacy
     svr->Post("/embeddings",          handle_embeddings);
     svr->Post("/v1/embeddings",       handle_embeddings_oai);
+    svr->Post("/v1/systemone",        handle_systemone);
     svr->Post("/tokenize",            handle_tokenize);
     svr->Post("/detokenize",          handle_detokenize);
     svr->Post("/apply-template",      handle_apply_template);
@@ -2105,8 +2369,18 @@ int main(int argc, char ** argv) {
             svr->Post("/zstd_incremental_maintenance", handle_zstd_maintenance);
             svr->Post("/zstd_enable_transparent", handle_zstd_enable);
             svr->Post("/zstd_update_transparent", handle_zstd_config_update);
-	}
+        }
 #endif
+    }
+
+    // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
+    if (params.webui_mcp_proxy) {
+        SRV_WRN("%s", "-----------------\n");
+        SRV_WRN("%s", "CORS proxy is enabled, do not expose server to untrusted environments\n");
+        SRV_WRN("%s", "This feature is EXPERIMENTAL and may be removed or changed in future versions\n");
+        SRV_WRN("%s", "-----------------\n");
+        svr->Get("/cors-proxy", proxy_handler_get);
+        svr->Post("/cors-proxy", proxy_handler_post);
     }
     //
     // Start the server

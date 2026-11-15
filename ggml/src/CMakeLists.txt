@@ -6,6 +6,9 @@ add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 if (GGML_MAX_CONTEXTS)
     add_compile_definitions(GGML_MAX_CONTEXTS=${GGML_MAX_CONTEXTS})
 endif()
+if (GGML_MAX_SRC)
+  add_compile_definitions(GGML_MAX_SRC=${GGML_MAX_SRC})
+endif()
 
 # enable libstdc++ assertions for debug builds
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -171,97 +174,13 @@ if (GGML_OPENMP)
     endif()
 endif()
 
-if (GGML_BLAS)
-    if (GGML_STATIC)
-        set(BLA_STATIC ON)
-    endif()
-    #if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
-    #    set(BLA_SIZEOF_INTEGER 8)
-    #endif()
-
-    set(BLA_VENDOR ${GGML_BLAS_VENDOR})
-    find_package(BLAS)
-
-    if (BLAS_FOUND)
-        message(STATUS "BLAS found, Libraries: ${BLAS_LIBRARIES}")
-
-        if (("${BLAS_INCLUDE_DIRS}" STREQUAL "") AND NOT (${GGML_BLAS_VENDOR} MATCHES "Apple"))
-            # BLAS_INCLUDE_DIRS is missing in FindBLAS.cmake.
-            # see https://gitlab.kitware.com/cmake/cmake/-/issues/20268
-            find_package(PkgConfig REQUIRED)
-            if (${GGML_BLAS_VENDOR} MATCHES "Generic")
-                pkg_check_modules(DepBLAS REQUIRED blas)
-            elseif (${GGML_BLAS_VENDOR} MATCHES "OpenBLAS")
-                # As of openblas v0.3.22, the 64-bit is named openblas64.pc
-                pkg_check_modules(DepBLAS openblas64)
-                if (NOT DepBLAS_FOUND)
-                    pkg_check_modules(DepBLAS REQUIRED openblas)
-                endif()
-            elseif (${GGML_BLAS_VENDOR} MATCHES "FLAME")
-                pkg_check_modules(DepBLAS REQUIRED blis)
-            elseif (${GGML_BLAS_VENDOR} MATCHES "ATLAS")
-                pkg_check_modules(DepBLAS REQUIRED blas-atlas)
-            elseif (${GGML_BLAS_VENDOR} MATCHES "FlexiBLAS")
-                pkg_check_modules(DepBLAS REQUIRED flexiblas_api)
-            elseif (${GGML_BLAS_VENDOR} MATCHES "Intel")
-                # all Intel* libraries share the same include path
-                pkg_check_modules(DepBLAS REQUIRED mkl-sdl)
-            elseif (${GGML_BLAS_VENDOR} MATCHES "NVHPC")
-                # this doesn't provide pkg-config
-                # suggest to assign BLAS_INCLUDE_DIRS on your own
-                if ("${NVHPC_VERSION}" STREQUAL "")
-                    message(WARNING "Better to set NVHPC_VERSION")
-                else()
-                    set(DepBLAS_FOUND ON)
-                    set(DepBLAS_INCLUDE_DIRS "/opt/nvidia/hpc_sdk/${CMAKE_SYSTEM_NAME}_${CMAKE_SYSTEM_PROCESSOR}/${NVHPC_VERSION}/math_libs/include")
-                endif()
-            endif()
-            if (DepBLAS_FOUND)
-                set(BLAS_INCLUDE_DIRS ${DepBLAS_INCLUDE_DIRS})
-            else()
-                message(WARNING "BLAS_INCLUDE_DIRS neither been provided nor been automatically"
-                " detected by pkgconfig, trying to find cblas.h from possible paths...")
-                find_path(BLAS_INCLUDE_DIRS
-                    NAMES cblas.h
-                    HINTS
-                        /usr/include
-                        /usr/local/include
-                        /usr/include/openblas
-                        /opt/homebrew/opt/openblas/include
-                        /usr/local/opt/openblas/include
-                        /usr/include/x86_64-linux-gnu/openblas/include
-                )
-            endif()
-        endif()
-
-        message(STATUS "BLAS found, Includes: ${BLAS_INCLUDE_DIRS}")
-
-        add_compile_options(${BLAS_LINKER_FLAGS})
-
-        list(APPEND GGML_CDEF_PUBLIC GGML_USE_BLAS)
-
-        if (${BLAS_INCLUDE_DIRS} MATCHES "mkl" AND (${GGML_BLAS_VENDOR} MATCHES "Generic" OR ${GGML_BLAS_VENDOR} MATCHES "Intel"))
-            add_compile_definitions(GGML_BLAS_USE_MKL)
-        endif()
-
-        set(GGML_HEADERS_BLAS ../include/ggml-blas.h)
-        set(GGML_SOURCES_BLAS ggml-blas.cpp)
-
-        set(GGML_EXTRA_LIBS     ${GGML_EXTRA_LIBS}     ${BLAS_LIBRARIES})
-        set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${BLAS_INCLUDE_DIRS})
-    else()
-        message(WARNING "BLAS not found, please refer to "
-        "https://cmake.org/cmake/help/latest/module/FindBLAS.html#blas-lapack-vendors"
-        " to set correct GGML_BLAS_VENDOR")
-    endif()
-endif()
-
 set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp iqk/iqk_cpu_ops.cpp)
 set (GGML_HEADERS_IQK iqk/iqk_config.h iqk/iqk_cpu_ops.h)
 if (GGML_IQK_MUL_MAT)
     message(STATUS "Using optimized iqk matrix multiplications")
     add_compile_definitions(GGML_USE_IQK_MULMAT)
     set(GGML_SOURCES_IQK_MM iqk/iqk_mul_mat.cpp
+                            iqk/iqk_kda.cpp
                             iqk/iqk_flash_attn.cpp
                             iqk/fa/iqk_fa_576_512.cpp
                             iqk/fa/iqk_fa_512_512.cpp
@@ -301,6 +220,10 @@ if (GGML_IQK_MUL_MAT)
     endif()
 endif()
 
+if (GGML_EXPERT_CHUNKING)
+    add_compile_definitions(GGML_EXPERT_CHUNKING)
+endif()
+
 if (GGML_CUDA)
     cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
@@ -332,13 +255,23 @@ if (GGML_CUDA)
                 #set(CMAKE_CUDA_ARCHITECTURES "OFF") # use this to compile much faster, but only F16 models work
             endif()
         endif()
-        message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
         else()
             enable_language(CUDA)
         endif()
+
+        if (CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+            list(TRANSFORM CMAKE_CUDA_ARCHITECTURES REPLACE "^(120|121)((-real)?)$" "\\1a\\2")
+        endif()
+        message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+        foreach(arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if (arch MATCHES "^(120|121)a(-real|-virtual)?$")
+                set_property(SOURCE ggml-cuda/nvfp4.cu APPEND PROPERTY COMPILE_DEFINITIONS "GGML_CUDA_NVFP4_${CMAKE_MATCH_1}A")
+            endif()
+        endforeach()
 
         file(GLOB   GGML_HEADERS_CUDA "ggml-cuda/*.cuh")
         list(APPEND GGML_HEADERS_CUDA "../include/ggml-cuda.h")
@@ -371,6 +304,8 @@ if (GGML_CUDA)
             list(APPEND GGML_SOURCES_CUDA ${SRCS})
             file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q6_0-q5_0.cu")
             list(APPEND GGML_SOURCES_CUDA ${SRCS})
+            file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q6_0-q6_0.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
             file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q8_0-q6_0.cu")
             list(APPEND GGML_SOURCES_CUDA ${SRCS})
         endif()
@@ -390,6 +325,10 @@ if (GGML_CUDA)
 
         if (GGML_CUDA_FORCE_DMMV)
             add_compile_definitions(GGML_CUDA_FORCE_DMMV)
+        endif()
+
+        if (GGML_CUDA_USE_DMMV)
+            add_compile_definitions(GGML_CUDA_USE_DMMV)
         endif()
 
         if (GGML_CUDA_FORCE_MMQ)
@@ -532,7 +471,11 @@ if (GGML_HIPBLAS)
     list(APPEND GGML_SOURCES_ROCM "ggml-cuda.cu")
     file(GLOB   SRCS "ggml-cuda/template-instances/fattn-wmma*.cu")
     list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB   SRCS "ggml-cuda/template-instances/fattn-mma*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
     file(GLOB   SRCS "ggml-cuda/template-instances/mmq*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB   SRCS "ggml-cuda/template-instances/mmvq-instance*.cu")
     list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
     if (GGML_CUDA_FA_ALL_QUANTS)
@@ -546,14 +489,31 @@ if (GGML_HIPBLAS)
         list(APPEND GGML_SOURCES_ROCM ${SRCS})
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*f16-f16.cu")
         list(APPEND GGML_SOURCES_ROCM ${SRCS})
+        file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q8_0-iq4_nl.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
+        file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*iq4_nl-iq4_nl.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
+        file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q6_0-q5_0.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
+        file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q6_0-q6_0.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
+        file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*q8_0-q6_0.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
     endif()
 
     list(APPEND GGML_CDEF_PUBLIC GGML_USE_CUDA)
 
     add_compile_definitions(GGML_USE_HIPBLAS)
+    # the sources imported from upstream test for GGML_USE_HIP, this fork only had the older
+    # GGML_USE_HIPBLAS spelling. Without it mmq_id_common.cuh defines TURING_MMA_AVAILABLE,
+    # AMPERE_MMA_AVAILABLE, CP_ASYNC_AVAILABLE and FP16_MMA_AVAILABLE, i.e. the inline PTX paths
+    add_compile_definitions(GGML_USE_HIP)
     add_compile_definitions(GGML_CUDA_DMMV_X=${GGML_CUDA_DMMV_X})
     add_compile_definitions(GGML_CUDA_MMV_Y=${GGML_CUDA_MMV_Y})
     add_compile_definitions(K_QUANTS_PER_ITERATION=${GGML_CUDA_KQUANTS_ITER})
+    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+    add_compile_definitions(GGML_CUDA_MIN_BATCH_OFFLOAD=${GGML_CUDA_MIN_BATCH_OFFLOAD})
+    add_compile_definitions(GGML_CUDA_FUSION=${GGML_CUDA_FUSION})
 
     if (GGML_HIP_UMA)
         add_compile_definitions(GGML_HIP_UMA)
@@ -563,12 +523,28 @@ if (GGML_HIPBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_DMMV)
     endif()
 
+    if (GGML_CUDA_USE_DMMV)
+        add_compile_definitions(GGML_CUDA_USE_DMMV)
+    endif()
+
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()
 
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+    endif()
+
+    if (GGML_CUDA_IQK_FORCE_BF16)
+        add_compile_definitions(GGML_CUDA_IQK_FORCE_BF16)
+    endif()
+
+    if (DEFINED GGML_CUDA_DMMV_Y)
+        add_compile_definitions(GGML_CUDA_MMV_Y=${GGML_CUDA_DMMV_Y}) # for backwards compatibility
+    endif()
+
+    if (GGML_CUDA_F16 OR GGML_CUDA_DMMV_F16)
+        add_compile_definitions(GGML_CUDA_F16)
     endif()
 
     if (GGML_CUDA_NO_PEER_COPY)
@@ -654,8 +630,9 @@ if (GGML_RPC)
         set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ws2_32)
     endif()
 
-    set(GGML_HEADERS_RPC ../include/ggml-rpc.h)
-    set(GGML_SOURCES_RPC ggml-rpc.cpp)
+    set(GGML_HEADERS_RPC ../include/ggml-rpc.h ggml-rpc-transport.h)
+    set(GGML_SOURCES_RPC ggml-rpc.cpp ggml-rpc-transport.cpp)
+		
 endif()
 
 function(detect_host_compiler)
@@ -860,165 +837,7 @@ if (GGML_VULKAN)
     endif()
 endif()
 
-if (GGML_KOMPUTE)
-    add_compile_definitions(VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1)
 
-    find_package(Vulkan COMPONENTS glslc REQUIRED)
-    find_program(glslc_executable NAMES glslc HINTS Vulkan::glslc)
-
-    if (NOT glslc_executable)
-        message(FATAL_ERROR "glslc not found")
-    endif()
-
-    function(compile_shader)
-        set(options)
-        set(oneValueArgs)
-        set(multiValueArgs SOURCES)
-        cmake_parse_arguments(compile_shader "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
-        foreach(source ${compile_shader_SOURCES})
-            get_filename_component(filename ${source} NAME)
-            set(spv_file ${filename}.spv)
-            add_custom_command(
-                OUTPUT ${spv_file}
-                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${source}
-                ${CMAKE_CURRENT_SOURCE_DIR}/kompute-shaders/common.comp
-                ${CMAKE_CURRENT_SOURCE_DIR}/kompute-shaders/op_getrows.comp
-                ${CMAKE_CURRENT_SOURCE_DIR}/kompute-shaders/op_mul_mv_q_n_pre.comp
-                ${CMAKE_CURRENT_SOURCE_DIR}/kompute-shaders/op_mul_mv_q_n.comp
-                COMMAND ${glslc_executable} --target-env=vulkan1.2 -o ${spv_file} ${CMAKE_CURRENT_SOURCE_DIR}/${source}
-                COMMENT "Compiling ${source} to ${spv_file}"
-                )
-
-            get_filename_component(RAW_FILE_NAME ${spv_file} NAME)
-            set(FILE_NAME "shader${RAW_FILE_NAME}")
-            string(REPLACE ".comp.spv" ".h" HEADER_FILE ${FILE_NAME})
-            string(TOUPPER ${HEADER_FILE} HEADER_FILE_DEFINE)
-            string(REPLACE "." "_" HEADER_FILE_DEFINE "${HEADER_FILE_DEFINE}")
-            set(OUTPUT_HEADER_FILE "${HEADER_FILE}")
-            message(STATUS "${HEADER_FILE} generating ${HEADER_FILE_DEFINE}")
-            if(CMAKE_GENERATOR MATCHES "Visual Studio")
-                add_custom_command(
-                    OUTPUT ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "/*THIS FILE HAS BEEN AUTOMATICALLY GENERATED - DO NOT EDIT*/" > ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo \"\#ifndef ${HEADER_FILE_DEFINE}\" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo \"\#define ${HEADER_FILE_DEFINE}\" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "namespace kp {" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "namespace shader_data {" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/xxd -i ${RAW_FILE_NAME} >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "}}" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo \"\#endif // define ${HEADER_FILE_DEFINE}\" >> ${OUTPUT_HEADER_FILE}
-                    DEPENDS ${spv_file} xxd
-                    COMMENT "Converting to hpp: ${FILE_NAME} ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/xxd"
-                    )
-            else()
-                add_custom_command(
-                    OUTPUT ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "/*THIS FILE HAS BEEN AUTOMATICALLY GENERATED - DO NOT EDIT*/" > ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo \"\#ifndef ${HEADER_FILE_DEFINE}\" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo \"\#define ${HEADER_FILE_DEFINE}\" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "namespace kp {" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "namespace shader_data {" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_BINARY_DIR}/bin/xxd -i ${RAW_FILE_NAME} >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo "}}" >> ${OUTPUT_HEADER_FILE}
-                    COMMAND ${CMAKE_COMMAND} -E echo \"\#endif // define ${HEADER_FILE_DEFINE}\" >> ${OUTPUT_HEADER_FILE}
-                    DEPENDS ${spv_file} xxd
-                    COMMENT "Converting to hpp: ${FILE_NAME} ${CMAKE_BINARY_DIR}/bin/xxd"
-                    )
-            endif()
-        endforeach()
-    endfunction()
-
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kompute/CMakeLists.txt")
-        message(STATUS "Kompute found")
-        set(KOMPUTE_OPT_LOG_LEVEL Error CACHE STRING "Kompute log level")
-        add_subdirectory(kompute)
-
-        # Compile our shaders
-        compile_shader(SOURCES
-            kompute-shaders/op_scale.comp
-            kompute-shaders/op_scale_8.comp
-            kompute-shaders/op_add.comp
-            kompute-shaders/op_addrow.comp
-            kompute-shaders/op_mul.comp
-            kompute-shaders/op_silu.comp
-            kompute-shaders/op_relu.comp
-            kompute-shaders/op_gelu.comp
-            kompute-shaders/op_softmax.comp
-            kompute-shaders/op_norm.comp
-            kompute-shaders/op_rmsnorm.comp
-            kompute-shaders/op_diagmask.comp
-            kompute-shaders/op_mul_mat_mat_f32.comp
-            kompute-shaders/op_mul_mat_f16.comp
-            kompute-shaders/op_mul_mat_q8_0.comp
-            kompute-shaders/op_mul_mat_q4_0.comp
-            kompute-shaders/op_mul_mat_q4_1.comp
-            kompute-shaders/op_mul_mat_q6_k.comp
-            kompute-shaders/op_getrows_f32.comp
-            kompute-shaders/op_getrows_f16.comp
-            kompute-shaders/op_getrows_q4_0.comp
-            kompute-shaders/op_getrows_q4_1.comp
-            kompute-shaders/op_getrows_q6_k.comp
-            kompute-shaders/op_rope_f16.comp
-            kompute-shaders/op_rope_f32.comp
-            kompute-shaders/op_cpy_f16_f16.comp
-            kompute-shaders/op_cpy_f16_f32.comp
-            kompute-shaders/op_cpy_f32_f16.comp
-            kompute-shaders/op_cpy_f32_f32.comp
-        )
-
-        # Create a custom target for our generated shaders
-        add_custom_target(generated_shaders DEPENDS
-            shaderop_scale.h
-            shaderop_scale_8.h
-            shaderop_add.h
-            shaderop_addrow.h
-            shaderop_mul.h
-            shaderop_silu.h
-            shaderop_relu.h
-            shaderop_gelu.h
-            shaderop_softmax.h
-            shaderop_norm.h
-            shaderop_rmsnorm.h
-            shaderop_diagmask.h
-            shaderop_mul_mat_mat_f32.h
-            shaderop_mul_mat_f16.h
-            shaderop_mul_mat_q8_0.h
-            shaderop_mul_mat_q4_0.h
-            shaderop_mul_mat_q4_1.h
-            shaderop_mul_mat_q6_k.h
-            shaderop_getrows_f32.h
-            shaderop_getrows_f16.h
-            shaderop_getrows_q4_0.h
-            shaderop_getrows_q4_1.h
-            shaderop_getrows_q6_k.h
-            shaderop_rope_f16.h
-            shaderop_rope_f32.h
-            shaderop_cpy_f16_f16.h
-            shaderop_cpy_f16_f32.h
-            shaderop_cpy_f32_f16.h
-            shaderop_cpy_f32_f32.h
-        )
-
-        # Create a custom command that depends on the generated_shaders
-        add_custom_command(
-            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ggml-kompute.stamp
-            COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/ggml-kompute.stamp
-            DEPENDS generated_shaders
-            COMMENT "Ensuring shaders are generated before compiling ggml-kompute.cpp"
-        )
-
-        # Add the stamp to the main sources to ensure dependency tracking
-        set(GGML_SOURCES_KOMPUTE ggml-kompute.cpp           ${CMAKE_CURRENT_BINARY_DIR}/ggml-kompute.stamp)
-        set(GGML_HEADERS_KOMPUTE ../include/ggml-kompute.h  ${CMAKE_CURRENT_BINARY_DIR}/ggml-kompute.stamp)
-
-        list(APPEND GGML_CDEF_PUBLIC GGML_USE_KOMPUTE)
-
-        set(GGML_EXTRA_LIBS     ${GGML_EXTRA_LIBS}     kompute)
-        set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${CMAKE_CURRENT_BINARY_DIR})
-    else()
-        message(WARNING "Kompute not found")
-    endif()
-endif()
 
 if (GGML_CPU_HBM)
     find_library(memkind memkind REQUIRED)
@@ -1174,7 +993,7 @@ if (GGML_CUDA)
 
         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
     endif()
-	
+
     if (GGML_FATAL_WARNINGS)
         list(APPEND CUDA_FLAGS -Werror all-warnings)
     endif()
@@ -1215,6 +1034,10 @@ if (GGML_CUDA)
 
     if (NOT MSVC)
         list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+    else()
+        # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
+        # https://github.com/NVIDIA/cccl/pull/6827
+        list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
     endif()
 endif()
 
@@ -1338,12 +1161,17 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
         endif()
         if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
             # else we fail on Gravitons and such
+            if (GGML_NATIVE)
+                list(APPEND ARCH_FLAGS -march=native)
+            endif()
             list(APPEND ARCH_FLAGS -flax-vector-conversions)
+        elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND GGML_NATIVE AND NOT APPLE)
+            list(APPEND ARCH_FLAGS -mcpu=native)
         endif()
     endif()
 elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
         (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
-         CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64)$"))
+         CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64|amd64)$"))
     message(STATUS "x86 detected")
     if (MSVC)
         # instruction set detection for MSVC only
@@ -1369,8 +1197,29 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
                 add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AVX512BF16__>)
                 add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AVX512BF16__>)
             endif()
+
+            # With GGML_NATIVE the extensions are probed, so reaching here means the
+            # CPU has no AVX512-VNNI (Skylake-X, Cascade Lake). Leaving
+            # HAVE_FANCY_SIMD off is correct there.
+            if (GGML_NATIVE AND NOT GGML_AVX512_VNNI)
+                message(STATUS
+                    "AVX-512 without VNNI detected. __AVX512VNNI__ stays undefined, "
+                    "HAVE_FANCY_SIMD is off, and the IQK GEMM kernels for Zen4 / Sapphire "
+                    "Rapids and later are not compiled, which is expected on this CPU.")
+            endif()
         elseif (GGML_AVX2)
             list(APPEND ARCH_FLAGS /arch:AVX2)
+            if (GGML_AVXVNNI)
+                # clang-cl supports -m flags alongside /arch: flags.
+                # Using -mavxvnni enables the actual target feature for clang,
+                # which is required for intrinsic functions like _mm256_dpbusd_avx_epi32.
+                if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+                    list(APPEND ARCH_FLAGS -mavxvnni)
+                else()
+                    add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AVXVNNI__>)
+                    add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AVXVNNI__>)
+                endif()
+            endif()
         elseif (GGML_AVX)
             list(APPEND ARCH_FLAGS /arch:AVX)
         endif()
@@ -1390,6 +1239,9 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         if (GGML_AVX2)
             list(APPEND ARCH_FLAGS -mavx2)
         endif()
+        if (GGML_AVXVNNI)
+            list(APPEND ARCH_FLAGS -mavxvnni)
+        endif()
         if (GGML_AVX512)
             list(APPEND ARCH_FLAGS -mavx512f)
             list(APPEND ARCH_FLAGS -mavx512bw)
@@ -1402,6 +1254,14 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         endif()
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
+        endif()
+        if (GGML_USE_I32GATHER)
+            message(STATUS "Prefer ZMM Gather Instructions")
+            add_compile_definitions(GGML_USE_I32GATHER)
+        endif()
+        if (GGML_CPU_INTEL_CLIENT)
+            message(STATUS "Build for Intel Client CPUs")
+            add_compile_definitions(GGML_CPU_INTEL_CLIENT)
         endif()
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
@@ -1438,6 +1298,7 @@ if (GGML_CUDA)
     endif()
 
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    set_source_files_properties(ggml-cuda/kt-encoder.cu ggml-cuda/ks-encoder.cu PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-ftz=false>")
 endif()
 
 if (MINGW)
@@ -1516,14 +1377,17 @@ add_library(ggml
             ggml.c
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-moe-prefetch.cpp
+            ggml-moe-prefetch.h
             ggml-quants.c
             ggml-quants.h
+            ggml-utils.h
+            ggml-impl.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
             ${GGML_SOURCES_EXTRA}     ${GGML_HEADERS_EXTRA}
             ${GGML_SOURCES_SYCL}      ${GGML_HEADERS_SYCL}
-            ${GGML_SOURCES_KOMPUTE}   ${GGML_HEADERS_KOMPUTE}
             ${GGML_SOURCES_VULKAN}    ${GGML_HEADERS_VULKAN}
             ${GGML_SOURCES_ROCM}      ${GGML_HEADERS_ROCM}
             ${GGML_SOURCES_BLAS}      ${GGML_HEADERS_BLAS}

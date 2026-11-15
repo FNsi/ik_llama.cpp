@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <tuple>
+#include <vector>
 
 struct llama_model;
 struct llama_context;
@@ -16,15 +17,36 @@ struct llama_kv_cache;
 struct ggml_cgraph;
 struct ggml_tensor;
 
+namespace llm_moe_cache_detail {
+inline bool mark_share_lookup_boundary(ggml_tensor * lookup) {
+    if (!lookup || lookup->op != GGML_OP_GET_ROWS) return false;
+    lookup->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+    return true;
+}
+
+inline bool share_ops_eligible(ggml_backend_t gpu_backend, ggml_backend_t cpu_backend,
+        const std::vector<ggml_tensor *> & host_ops, const std::vector<ggml_tensor *> & cached_ops) {
+    if (!gpu_backend || !cpu_backend) return false;
+    for (const ggml_tensor * op : host_ops) {
+        if (!op || !ggml_backend_supports_op(cpu_backend, op) || ggml_backend_offload_op(gpu_backend, op)) return false;
+    }
+    for (const ggml_tensor * op : cached_ops) {
+        if (!op || !ggml_backend_supports_op(gpu_backend, op)) return false;
+    }
+    return !host_ops.empty() && !cached_ops.empty();
+}
+}
+
 using llm_build_cb = std::function<void(struct ggml_tensor * cur, const char * name, int nl)>;
 
 enum llm_ffn_op_type {
     LLM_FFN_SILU,
+    LLM_FFN_SITU,
     LLM_FFN_GELU,
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
-    LLM_FFN_SWIGLU_OAI_MOE,
+    LLM_FFN_SWIGLU_OAI,
 };
 
 enum llm_ffn_gate_type {
@@ -35,6 +57,32 @@ enum llm_ffn_gate_type {
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
+};
+
+// query rows per MiniMax-M3 indexer-score chunk, bounds the F32 score of a prefill ubatch as in glm5next
+constexpr int32_t MINIMAXM3_MSA_SCORE_CHUNK = 256;
+
+struct post_norm_data {
+    std::vector<ggml_tensor *> next_input;
+    ggml_tensor * norm;
+    float         f_rms_eps;
+};
+
+struct mla_pp_params {
+    ggml_cgraph * gf = nullptr;
+    int il = -1;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * cache = nullptr;
+    ggml_tensor * wkv_b = nullptr;
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * dsa_last_full_sorted = nullptr;
+    int64_t n_head = 0;
+    int64_t n_embd_head_k = 0;
+    int64_t n_embd_head_v = 0;
+    int64_t n_extra = 0;
+    int64_t kv_lora_rank = 0;
+    float kq_scale = 0.0f;
+    bool force_flash_f32 = false;
 };
 
 struct llm_build_context {
@@ -68,10 +116,12 @@ struct llm_build_context {
     const float norm_rms_eps;
 
     const int32_t n_tokens;
+    int32_t n_tokens_seg;   // token count of the segment being built (n_tokens unless replaying)
     const int32_t n_kv;     // size of KV cache to consider (n_kv <= kv_self.size)
     const int32_t n_outputs;
     const int32_t n_outputs_enc;
     const int32_t kv_head;  // index of where we store new KV data in the cache
+    const int32_t swa_head; // same, for --swa-compress layers; equals kv_head otherwise
     const int32_t n_ctx_orig;
 
     const bool flash_attn;
@@ -89,12 +139,21 @@ struct llm_build_context {
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
+    const bool clear_lctx_inputs;
+    const bool worst_case;  // the graph only sizes buffers, so it must be at least as large as any real batch's
 
     const llm_build_cb & cb;
 
     std::vector<uint8_t> & buf_compute_meta;
 
     struct ggml_context * ctx0 = nullptr;
+
+    // GLM-5.2 IndexShare: the most-recent "full" indexer layer's top-k selection (argsort indices).
+    // "shared" layers reuse this instead of computing their own. Reset to nullptr at each graph build.
+    struct ggml_tensor * dsa_last_full_sorted = nullptr;
+    struct ggml_tensor * last_sparse_mask_fa  = nullptr;
+    struct ggml_tensor * last_sparse_mask     = nullptr;
+    struct ggml_tensor * dsa_tg_fast_mask     = nullptr;
 
     // TODO: consider making the entire interface noexcept
     llm_build_context(
@@ -103,11 +162,15 @@ struct llm_build_context {
     const llm_build_cb & cb,
     bool   worst_case,
     bool   warmup,
-    int    n_outputs = 0);
+    int    n_outputs = 0,
+    bool   clear_lctx_inputs = true,
+    std::vector<uint8_t> * buf_compute_meta_override = nullptr);
 
     void init();
 
     void free();
+
+    bool supports_op(const ggml_tensor * op) const;
 
     ggml_cgraph * build_k_shift();
 
@@ -116,6 +179,15 @@ struct llm_build_context {
     ggml_cgraph * build_defrag(const std::vector<uint32_t> & ids);
 
     struct ggml_tensor * build_inp_embd_mtp(struct ggml_tensor * mtp_tok_embd);
+
+    struct ggml_tensor * build_inp_mtp_states(int64_t n_hidden);
+
+    struct ggml_tensor * build_mtp_input(
+            const struct llama_layer & mtp_layer,
+            struct ggml_tensor * hidden_state,
+            struct ggml_tensor * token_embd,
+            int il,
+            const char * output_name = "mtp_eh_proj");
 
     ggml_tensor * build_inp_pos();
 
@@ -128,6 +200,11 @@ struct llm_build_context {
     ggml_tensor * build_inp_KQ_mask(bool causal = true);
 
     ggml_tensor * build_inp_KQ_mask_swa(bool causal = true);
+
+    ggml_tensor * build_inp_KQ_mask_swa_win(int64_t n_kv_win, bool causal = true);
+
+    ggml_tensor * build_swa_mask_for_graph(uint32_t window, bool compacted, bool * windowed = nullptr,
+            const llama_kv_cache * kv = nullptr);
 
     ggml_tensor * build_inp_mean();
 
@@ -153,7 +230,7 @@ struct llm_build_context {
             ggml_tensor * wq, ggml_tensor * bq,
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
-            float attention_scale, int il, bool add_graph_split = false) const;
+            float attention_scale, int il, bool add_graph_split = false, ggml_tensor * v_cur = nullptr) const;
 
     std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_mul_mat_qkv(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * wqkv, ggml_tensor * bqkv,
@@ -161,12 +238,17 @@ struct llm_build_context {
             ggml_tensor * wq, ggml_tensor * bq,
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
-            ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split = false) const;
+            ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split = false,
+            ggml_tensor * v_cur = nullptr) const;
 
     std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_mul_mat_qkv_gated(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const;
 
     ggml_cgraph * build_llama();
+
+    ggml_cgraph * build_muse_glimmer();
+
+    ggml_cgraph * build_ricursive();
 
     ggml_cgraph * build_mistral3();
 
@@ -208,9 +290,19 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen3moe();
 
+    ggml_cgraph * build_mellum();
+    ggml_cgraph * build_maple();
+
     ggml_cgraph * build_qwen3vlmoe();
 
     ggml_cgraph * build_qwen3next();
+    ggml_cgraph * build_qwen4exp();
+
+    ggml_tensor * build_lfm_shortconv(ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * state_seq,
+            uint32_t state_seq_id, bool reset_state, int il);
+
+    ggml_cgraph * build_lfm2();
+    ggml_cgraph * build_lfm3();
 
     ggml_cgraph * build_qwen35moe();
 
@@ -242,6 +334,12 @@ struct llm_build_context {
 
     ggml_cgraph * build_gemma4_mtp();
 
+    ggml_cgraph * build_dflash();
+
+    ggml_cgraph * build_dflash_dsv4();
+
+    ggml_cgraph * build_dflash_kv_cache();
+
     ggml_cgraph * build_starcoder2();
 
     ggml_cgraph * build_mamba();
@@ -257,6 +355,65 @@ struct llm_build_context {
     ggml_cgraph * build_arctic();
 
     ggml_cgraph * build_deepseek2();
+    ggml_cgraph * build_deepseek4();
+    ggml_cgraph * build_deepseek41();
+    ggml_cgraph * build_openpangu();
+
+    // openPangu attention sublayer body (shared by base layers and the NextN/MTP head):
+    // input is the already-input-normed hidden; returns the post-o_proj attention output.
+    ggml_tensor * build_openpangu_attention(
+        ggml_cgraph * gf,
+        const struct llama_layer & layer,
+        int il,
+        ggml_tensor * x_normed,
+        ggml_tensor * KQ_mask,
+        ggml_tensor * inp_pos,
+        ggml_tensor * conv_state,
+        ggml_tensor * seq_qnext,
+        float kq_scale,
+        bool KQ_mask_swa_windowed = false);
+
+    // openPangu NextN/MTP head (plain-residual block, no mHC): eh_proj stitching ->
+    // attention -> MoE -> shared head. Returns the draft logits tensor.
+    ggml_tensor * build_openpangu_mtp(
+        const struct llama_layer & mtp_layer,
+        ggml_tensor * prev_embeddings,
+        ggml_cgraph * gf,
+        int il,
+        ggml_tensor * inp_pos,
+        ggml_tensor * KQ_mask,
+        ggml_tensor * inp_out_ids,
+        ggml_tensor * inp_tokens,
+        ggml_tensor * seq_qnext,
+        ggml_tensor ** full_hidden_out = nullptr,
+        bool select_outputs = true,
+        bool build_logits = true,
+        bool cache_writes_only = false,
+        bool KQ_mask_swa_windowed = false);
+
+    ggml_tensor * build_mhc_post(
+        ggml_tensor * x,
+        ggml_tensor * post,
+        ggml_tensor * residual,
+        ggml_tensor * comb,
+        int64_t n_embd,
+        int64_t n_stream,
+        bool comb_output_dim0);
+
+    ggml_tensor * build_mhc_weighted_sum(
+        ggml_tensor * x,
+        ggml_tensor * weights,
+        int64_t n_embd,
+        int64_t n_stream);
+
+    ggml_tensor * build_mhc_pre_projection(
+        ggml_tensor * x,
+        ggml_tensor * fn,
+        ggml_tensor * gamma,
+        int64_t n_embd,
+        int64_t n_stream,
+        float norm_rms_eps,
+        bool force_contiguous);
 
     ggml_tensor * build_deepseek2_tp_attention(
             ggml_cgraph * gf, int il,
@@ -265,7 +422,8 @@ struct llm_build_context {
             ggml_tensor * rope_cache,
             float kq_scale, float attn_factor_scaled,
             bool use_f32_attn_precision,
-            bool is_lite);
+            bool is_lite,
+            bool pp_opt);
 
     ggml_tensor * build_deepseek2_layer_attention(
             ggml_cgraph * gf, int il,
@@ -277,6 +435,27 @@ struct llm_build_context {
             bool is_lite,
             bool pp_opt);
 
+    // DSA lightning indexer (GLM-5.2 / DeepSeek-V3.2). Cache-backed (persistent indexer-key cache).
+    // Returns the FULL descending argsort of the per-query indexer scores [n_kv, n_tokens] (I32).
+    ggml_tensor * build_deepseek2_dsa_indexer(
+            ggml_cgraph * gf,
+            int il,
+            ggml_tensor * qr,       // q_lora latent [q_lora_rank, n_tokens] (after attn_q_a_norm)
+            ggml_tensor * cur,      // attn_norm output [n_embd, n_tokens]
+            ggml_tensor * KQ_mask,  // F32 causal mask [n_kv, n_tokens_pad]
+            ggml_tensor * inp_pos);
+
+    // Build the additive sparse causal mask from the full score ranking + the base causal KQ_mask.
+    ggml_tensor * build_deepseek2_dsa_sparse_mask(
+            ggml_tensor * sorted,   // [n_kv, n_tokens] (I32) full descending argsort of scores
+            ggml_tensor * KQ_mask); // F32 causal mask [n_kv, n_tokens_pad]
+
+    // Adapt the (F32, unpadded) sparse mask to the shape/dtype ggml_flash_attn_ext requires on this
+    // fork: F16, contiguous, ne[1] padded to GGML_KQ_MASK_PAD (== the dense KQ_mask's padded shape).
+    ggml_tensor * build_deepseek2_dsa_fa_mask(
+            ggml_tensor * sparse,   // [n_kv, n_tokens] (F32) additive sparse causal mask
+            ggml_tensor * KQ_mask); // FA dense mask [n_kv, n_tokens_pad] (F16 when -fa 1)
+
     ggml_cgraph * build_glm4_moe();
 
     ggml_cgraph * build_bitnet();
@@ -284,6 +463,7 @@ struct llm_build_context {
     ggml_cgraph * build_bitnet_158();
 
     ggml_cgraph * build_cohere2();
+    ggml_cgraph * build_cohere2_moe();
 
     ggml_cgraph * build_t5_encoder();
 
@@ -294,6 +474,7 @@ struct llm_build_context {
     ggml_cgraph * build_chatglm();
 
     ggml_cgraph * build_glm4();
+    ggml_cgraph * build_glm4_with_mtp();
 
     ggml_cgraph * build_dots1();
 
@@ -306,23 +487,54 @@ struct llm_build_context {
     ggml_cgraph * build_openai_moe();
 
     ggml_cgraph * build_bailingmoe2();
+    ggml_cgraph * build_bailingmoe3();
+    ggml_cgraph * build_glm5next();
+    ggml_cgraph * build_raon1();
+    ggml_cgraph * build_xing4();
+
+    ggml_cgraph * build_glm5next_mtp();
 
     ggml_cgraph * build_minimaxm2();
+    ggml_cgraph * build_minimaxm3();
 
     ggml_cgraph * build_smollm3();
 
+    ggml_cgraph * build_spark2_5();
+
     ggml_cgraph * build_mimo2();
+
+    ggml_cgraph * build_flint();
 
     ggml_cgraph * build_seedoss();
 
+    ggml_cgraph * build_laguna();
+
     ggml_cgraph * build_step35();
+
+    ggml_cgraph * build_k2horizon();
+
+    ggml_tensor * build_step35_mtp(
+            const llama_layer & mtp_layer,
+            ggml_tensor * hidden_states_from_main_model,
+            ggml_cgraph * gf,
+            ggml_tensor * inp_pos,
+            bool reduce_output = true,
+            bool emit_logits = true,
+            ggml_tensor ** hidden_out = nullptr);
 
     //
     static ggml_tensor * llm_build_lora_mm(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * w, ggml_tensor * cur);
 
+    ggml_tensor * build_mla_expanded_pp(const mla_pp_params & p);
+
+    static ggml_tensor * build_mla_output_gate(llama_context & lctx, ggml_context * ctx0,
+            ggml_tensor * output, ggml_tensor * input, ggml_tensor * gate_w,
+            int64_t head_dim, int64_t n_head, int il, const llm_build_cb & cb);
+
     static ggml_tensor * llm_build_lora_mm_id(llama_context & lctx, ggml_context * ctx0,
-          ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids);
+          ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids,
+          ggml_tensor * cache_w = nullptr, ggml_tensor * cache_ids = nullptr, bool fuse_signs = true);
 
     static ggml_tensor * llm_build_inp_embd(ggml_context * ctx, llama_context & lctx,
         const llama_hparams & hparams,
@@ -361,7 +573,8 @@ struct llm_build_context {
                     int32_t   n_kv,
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
-         ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr);
+         ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
+                    int32_t   swa_head = -1, ggml_tensor * kv_idx = nullptr);
 
     static ggml_tensor * llm_build_ffn(ggml_context * ctx, llama_context & lctx, ggml_tensor * ffn_norm,
          ggml_tensor * cur,
@@ -378,7 +591,13 @@ struct llm_build_context {
             llm_ffn_op_type   type_op,
           llm_ffn_gate_type   type_gate,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
-         bool is_norm = false, ggml_tensor * add_extra = nullptr, ggml_tensor * post_norm = nullptr);
+         bool is_norm = false, ggml_tensor * add_extra = nullptr,
+         ggml_tensor * post_norm = nullptr, float post_norm_eps = 0.0f,
+         post_norm_data * pnd = nullptr);
+
+    static ggml_tensor * build_dspark_logits(llm_build_context & llm,
+            ggml_tensor * base_logits, ggml_tensor * input_tokens,
+            ggml_tensor ** draft_tokens = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -396,7 +615,8 @@ struct llm_build_context {
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr);
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * selected_experts = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -424,7 +644,7 @@ llm_expert_gating_func_type   gating_op,
                 n_expert, n_expert_used,
                 type_op, norm_w, scale_w, w_scale,
                 gating_op, cb, il, graph, add_input, up_gate_exps, up_gate_exps_b,
-                input_logits, down_exps_s);
+                input_logits, down_exps_s, nullptr);
     }
 
     static ggml_tensor * llm_build_std_moe_ffn(ggml_context * ctx, llama_context & lctx,
@@ -448,7 +668,7 @@ llm_expert_gating_func_type   gating_op,
             llm_ffn_op_type   type_op_shexp,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * shexp_gate = nullptr);
+         ggml_tensor * shexp_gate = nullptr, ggml_tensor * add_extra = nullptr);
 
     static ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids);
 
@@ -456,13 +676,17 @@ llm_expert_gating_func_type   gating_op,
 
     static ggml_cgraph * llama_build_graph_s_copy(llama_context & lctx);
 
+    static ggml_cgraph * llama_build_graph_dflash_kv_cache(llama_context & lctx);
+
     static ggml_cgraph * llama_build_graph(llama_context & lctx, const llama_batch & batch, bool worst_case, int n_outputs = 0);
 
     ggml_tensor * build_std_attention(ggml_cgraph * gf, ggml_tensor * attn_norm, ggml_tensor * cur,
             ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
-            bool is_multi = false, ggml_tensor * post_norm = nullptr);
+            bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1, float post_norm_eps = 0.0f,
+            post_norm_data * pnd = nullptr, ggml_tensor ** k_view = nullptr, ggml_tensor ** v_view = nullptr,
+            ggml_tensor * kv_idx = nullptr, ggml_tensor * v_res = nullptr);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 
@@ -485,12 +709,21 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * rope_cache
     );
 
+    struct ggml_tensor * build_deepseek2_mtp(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos,
+        struct ggml_tensor * rope_cache
+    );
+
     struct ggml_tensor * build_qwen35_mtp(
         const struct llama_layer & mtp_layer,
         struct ggml_tensor * prev_embeddings,
         int64_t n_embd_head,
         struct ggml_cgraph * gf,
-        struct ggml_tensor * inp_pos
+        struct ggml_tensor * inp_pos,
+        bool emit_logits
     );
 
     struct ggml_tensor * build_qwen35moe_mtp(
@@ -498,6 +731,9 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * prev_embeddings,
         int64_t n_embd_head,
         struct ggml_cgraph * gf,
-        struct ggml_tensor * inp_pos
+        struct ggml_tensor * inp_pos,
+        bool emit_logits
     );
+
+    ggml_cgraph * new_graph_custom();
 };

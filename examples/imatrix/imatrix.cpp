@@ -6,7 +6,9 @@
 //
 
 #include "common.h"
+#include "speculative.h"
 #include "llama.h"
+#include "llama-spec-features.h"
 
 #include <cmath>
 #include <cstdio>
@@ -98,8 +100,6 @@ static bool add_and_check_nans(int n, const float * x, float * y, int * counts) 
     return add_and_check_nans_scalar(n, x, y, counts);
 }
 
-
-uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx);
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
 
 static llama_model * ik_load_model_from_params(const gpt_params & params, const llama_model_params & mparams) {
@@ -225,6 +225,8 @@ static llama_init_result ik_init_from_loaded_model(llama_model * model, gpt_para
 static void print_usage(int argc, char ** argv, const gpt_params & params) {
     gpt_params_print_usage(argc, argv, params);
 
+    LOG_TEE("\nimatrix-specific options:\n\n");
+    LOG_TEE("  -lsim, --layer-similarity    collect layer similarity data\n");
     LOG_TEE("\nexample usage:\n");
     LOG_TEE("\n    %s \\\n"
             "       -m model.gguf -f some-text.txt [-o imatrix.dat] [--process-output] [--verbosity 1] \\\n"
@@ -497,7 +499,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     const float * x = (const float *)((const char *)data + i11*src1->nb[1] + i12*src1->nb[2]);
 
                     if (add_and_check_nans(src1->ne[0], x, e.values.data() + e_start, e.counts.data() + e_start)) {
-                        fprintf(stderr, "etected NaNs in %s\n", wname.c_str());
+                        fprintf(stderr, "detected NaNs in %s\n", wname.c_str());
                         exit(1);
                     }
                     //for (int j = 0; j < (int)src1->ne[0]; ++j) {
@@ -561,7 +563,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 exit(1);
             }
             // If we have a 3D tensor as it is the case for the attn_k_b and attn_v_b for DeepSeek MLA models,
-            // than we need to compute the imatrix for each head, and not just one imatrx for all heads.
+            // than we need to compute the imatrix for each head, and not just one imatrix for all heads.
             // Hence, the storage we need is src0->ne[0]*src0->ne[2].
             e.values.resize(src0->ne[0]*src0->ne[2], 0);
             e.counts.resize(src0->ne[0]*src0->ne[2], 0);
@@ -774,7 +776,7 @@ bool IMatrixCollector::load_imatrix(const char * fname) {
             return false;
         }
 
-        // Recreate the state as expected by save_imatrix(), and corerct for weighted sum.
+        // Recreate the state as expected by save_imatrix(), and correct for weighted sum.
         for (int i = 0; i < nval; i++) {
             e.values[i] += tmp[i];
             e.counts[i] += ncall;
@@ -792,8 +794,8 @@ static IMatrixCollector * ik_get_imatrix_collector(void * user_data) {
     return user_data != nullptr ? static_cast<IMatrixCollector *>(user_data) : &g_target_collector;
 }
 
-static bool ik_collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data) {
-    return ik_get_imatrix_collector(user_data)->collect_imatrix(t, ask, user_data);
+static int ik_collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data) {
+    return ik_get_imatrix_collector(user_data)->collect_imatrix(t, ask, user_data) ? 1 : 0;
 }
 
 
@@ -871,6 +873,7 @@ static void process_logits(
 
 static gpt_params build_draft_imatrix_params(const gpt_params & params) {
     gpt_params draft_params = params;
+    common_speculative_reset_draft_offload_defaults(draft_params);
 
     draft_params.model = params.speculative.model;
     draft_params.model_url.clear();
@@ -927,7 +930,11 @@ static bool compute_draft_imatrix_batch(
     }
 
     llama_set_mtp_op_type(ctx_dft, MTP_OP_DRAFT_GEN);
-    llama_set_draft_input_hidden_state(ctx_dft, hidden);
+    if (!llama_set_draft_input_hidden_state_copy(ctx_dft, hidden, (size_t) batch_size * n_embd_dft)) {
+        llama_set_mtp_op_type(ctx_dft, MTP_OP_NONE);
+        fprintf(stderr, "%s: failed to stage paired draft hidden snapshot\n", __func__);
+        return false;
+    }
     const int ret = llama_decode(ctx_dft, llama_batch_get_one(draft_tokens + batch_start, batch_size, batch_pos, 0));
     llama_set_mtp_op_type(ctx_dft, MTP_OP_NONE);
 
@@ -1229,7 +1236,7 @@ int main(int argc, char ** argv) {
     }
 
     if (!use_paired_gemma4_mtp && llama_model_is_gemma4_mtp_assistant(model) && !params.process_output) {
-        fprintf(stderr, "%s: warning: standalone Gemma 4 assistant imatrix does not exercise the assistant layers. Use '-m <target> -md <assistant> -mtp' for meaningful calibration.\n", __func__);
+        fprintf(stderr, "%s: warning: standalone Gemma 4 assistant imatrix does not exercise the assistant layers. Use '-m <target> -md <assistant> --spec-type mtp:n_max=1,p_min=0.0' for meaningful calibration.\n", __func__);
     }
 
     const int n_ctx_train = llama_n_ctx_train(model);

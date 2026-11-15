@@ -263,7 +263,7 @@ static ggml_backend_t create_gpu_backend(const rpc_server_params& params, uint32
     ggml_backend_t backend = NULL;
 #ifdef GGML_USE_CUDA
     fprintf(stderr, "%s: using CUDA backend: CUDA%d\n", __func__, device);
-    backend = ggml_backend_cuda_init(device, nullptr); // init device
+    backend = ggml_backend_cuda_init(device, nullptr, nullptr); // init device
     if (!backend) {
         fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
     }
@@ -439,7 +439,7 @@ int main(int argc, char * argv[]) {
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {
-        cache_dir_str = fs_get_cache_directory() + "rpc/";
+        cache_dir_str = fs_get_cache_directory() + "rpc" + DIRECTORY_SEPARATOR;
         if (!fs_create_directory_with_parents(cache_dir_str)) {
             fprintf(stderr, "Failed to create cache directory: %s\n", cache_dir_str.c_str());
             return 1;
