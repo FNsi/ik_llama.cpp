@@ -116,6 +116,7 @@ std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
         { GGML_TYPE_IQ5_KS_R16,  { GGML_TYPE_IQ5_KS, 16} },
         { GGML_TYPE_IQ5_K_R4,    { GGML_TYPE_IQ5_K, 4} },
         { GGML_TYPE_MXFP4_R8,    { GGML_TYPE_MXFP4, 8} },
+        { GGML_TYPE_Q1_0_G128_R8, { GGML_TYPE_Q1_0_G128, 8} },
         { GGML_TYPE_PQ2_0_R8,    { GGML_TYPE_PQ2_0, 8} },
         { GGML_TYPE_PTQ1_0_R8,   { GGML_TYPE_PTQ1_0, 8} },
         { GGML_TYPE_Q8_KV_R8,    { GGML_TYPE_Q8_KV, 8} },
@@ -269,6 +270,18 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny, bo
             convert_incompatible_tensor = true;
         }
     }
+    if (new_type == GGML_TYPE_Q1_0_G128_R8) {
+        if (nx % QK1_0_G128 != 0 || ny % QK1_0_G128_R8_ROWS != 0) {
+            LLAMA_LOG_WARN("\n\n%s : tensor %d x %d is not compatible with %s (needs cols %% %d == 0 and rows %% %d == 0)", __func__, nx, ny, ggml_type_name(new_type), QK1_0_G128, QK1_0_G128_R8_ROWS);
+            convert_incompatible_tensor = true;
+        }
+    }
+    if (new_type == GGML_TYPE_Q1_0_G128) {
+        if (nx % QK1_0_G128 != 0) {
+            LLAMA_LOG_WARN("\n\n%s : tensor %d x %d is not compatible with %s (needs cols %% %d == 0)", __func__, nx, ny, ggml_type_name(new_type), QK1_0_G128);
+            convert_incompatible_tensor = true;
+        }
+    }
     if (new_type == GGML_TYPE_IQ3_KS_R16) {
         if (nx % 32 != 0 || ny % 16 != 0) {
             LLAMA_LOG_WARN("\n\n%s : tensor %d x %d is not compatible with %s (needs cols %% 32 == 0 and rows %% 16 == 0)", __func__, nx, ny, ggml_type_name(new_type));
@@ -329,6 +342,8 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny, bo
             case GGML_TYPE_Q8_K_R8:
             case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_NVFP4_KS: new_type = GGML_TYPE_MXFP4; break;
+            case GGML_TYPE_Q1_0_G128:
+            case GGML_TYPE_Q1_0_G128_R8: new_type = GGML_TYPE_F16; break;
             default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
         }
         if (nx % ggml_row_blck_size(new_type) != 0) {
@@ -337,6 +352,23 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny, bo
         LLAMA_LOG_WARN(" - using fallback quantization %s\n", ggml_type_name(new_type));
     }
     return new_type;
+}
+
+
+static ggml_type custom_quant_match(const llama_model_quantize_params * params, const std::string & name) {
+    if (!params->custom_quants) {
+        return GGML_TYPE_COUNT;
+    }
+    using CustomQ = std::pair<std::string, ggml_type>;
+    const auto & q_rules = *static_cast<const std::vector<CustomQ> *>(params->custom_quants);
+    for (const auto & rule : q_rules) {
+        std::regex pattern(rule.first);
+        if (std::regex_search(name, pattern)) {
+            LLAMA_LOG_INFO("Using custom type %s for tensor %s\n", ggml_type_name(rule.second), name.c_str());
+            return rule.second;
+        }
+    }
+    return GGML_TYPE_COUNT;
 }
 
 static bool is_repack_forbidden(const std::string& name) {
@@ -382,18 +414,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
     };
 
-    auto custom_type = GGML_TYPE_COUNT;
-    if (qs.params->custom_quants) {
-        using CustomQ = std::pair<std::string, ggml_type>;
-        auto& q_rules = *static_cast<const std::vector<CustomQ>*>(qs.params->custom_quants);
-        for (auto& rule : q_rules) {
-            std::regex pattern(rule.first);
-            if (std::regex_search(name, pattern)) {
-                custom_type = rule.second;
-                break;
-            }
-        }
-    }
+    ggml_type custom_type = custom_quant_match(qs.params, name);
 
     //auto get_layer = [] (const char * name) {
     //    int il;
@@ -453,7 +474,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
             }
             else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_0_R8 && new_type != GGML_TYPE_IQ6_K && new_type != GGML_TYPE_Q6_K_R4 &&
                      new_type != GGML_TYPE_Q8_K_R8 && new_type != GGML_TYPE_Q8_KV && new_type != GGML_TYPE_Q8_KV_R8 &&
-                     new_type != GGML_TYPE_Q8_K_R16) {
+                     new_type != GGML_TYPE_Q8_K_R16 &&
+                     new_type != GGML_TYPE_Q1_0_G128 && new_type != GGML_TYPE_Q1_0_G128_R8) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -907,7 +929,6 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
 
     if (custom_type < GGML_TYPE_COUNT) {
         new_type = custom_type;
-        LLAMA_LOG_INFO("Using custom type %s for tensor %s\n", ggml_type_name(new_type), name.c_str());
     }
 
     auto tentative_new_type = new_type;
@@ -1022,6 +1043,7 @@ static llama_ftype repacked_ftype(llama_ftype ftype) {
         { LLAMA_FTYPE_MOSTLY_IQ4_KS,  LLAMA_FTYPE_MOSTLY_IQ4_KS_R4  },
         { LLAMA_FTYPE_MOSTLY_IQ5_KS,  LLAMA_FTYPE_MOSTLY_IQ5_KS_R4  },
         { LLAMA_FTYPE_MOSTLY_Q8_KV,   LLAMA_FTYPE_MOSTLY_Q8_KV_R8   },
+        { LLAMA_FTYPE_MOSTLY_Q1_0_G128, LLAMA_FTYPE_MOSTLY_Q1_0_G128_R8 },
     };
     if (auto it = k_map.find(ftype); it != k_map.end()) return it->second;
     return ftype;
@@ -1767,6 +1789,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
             // get more optimal quantization type based on the tensor shape, layer, etc.
             if (params->pure) {
+                ggml_type custom_type = custom_quant_match(params, name);
+                if (custom_type < GGML_TYPE_COUNT) {
+                    new_type = custom_type;
+                }
                 auto working_type = change_type_if_necessary(new_type, tensor->ne[0], tensor->ne[1], false);
                 if (working_type != new_type) {
                     ++qs.n_fallback;

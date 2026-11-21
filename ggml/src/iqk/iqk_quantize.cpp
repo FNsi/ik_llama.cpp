@@ -11868,6 +11868,27 @@ size_t quantize_q1_0_g128(const float * src, void * dst, int64_t nrows, int64_t 
     return nblock * sizeof(block_q1_0_g128);
 }
 
+size_t quantize_q1_0_g128_r8(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix,
+        [[maybe_unused]] const quantize_user_data * user_data) {
+    GGML_ASSERT(nrows%QK1_0_G128_R8_ROWS == 0);
+    GGML_ASSERT(n_per_row%QK1_0_G128 == 0);
+    QHelper helper(imatrix, user_data, n_per_row, QK1_0_G128);
+    auto q_func = [] (const float * x, void * vy, int n_per_row_, const float * imatrix_,
+            [[maybe_unused]] const quantize_user_data * user_data_) {
+        quantize_q1_0_g128(x, vy, 1, n_per_row_, imatrix_, nullptr);
+    };
+    const int row_size = ggml_row_size(GGML_TYPE_Q1_0_G128, n_per_row);
+    std::vector<char> qtmp(QK1_0_G128_R8_ROWS*row_size);
+    char * qcur = (char *)dst;
+    for (int row = 0; row < nrows; row += QK1_0_G128_R8_ROWS) {
+        helper.quantize(QK1_0_G128_R8_ROWS, src, qtmp.data(), row_size, q_func);
+        repack_q1_0_g128_r8(QK1_0_G128_R8_ROWS, n_per_row, (const block_q1_0_g128 *)qtmp.data(), (block_q1_0_g128_r8 *)qcur, false);
+        src += QK1_0_G128_R8_ROWS*n_per_row;
+        qcur += QK1_0_G128_R8_ROWS*row_size;
+    }
+    return (size_t)nrows*ggml_row_size(GGML_TYPE_Q1_0_G128_R8, n_per_row);
+}
+
 void dequantize_row_q1_0_g128(const block_q1_0_g128  * x, float * y, int64_t k) {
     assert(k % QK1_0_G128 == 0);
     constexpr uint8_t k_mask[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};

@@ -593,6 +593,8 @@ static_assert(sizeof(block_iq1_m_r4) == 28, "wrong iq1_m_r4 block size/padding")
 // Bonsai
 //
 #define QK1_0_G128 128
+#define QR1_0_G128 8
+#define QI1_0_G128 (QK1_0_G128 / (4 * QR1_0_G128))
 typedef struct {
     ggml_half  d;
     uint8_t    qs[QK1_0_G128 / 8];

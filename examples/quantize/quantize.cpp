@@ -51,6 +51,8 @@ static const std::vector<struct quant_option> QUANT_OPTIONS = {
     { "PTQ1_0",   LLAMA_FTYPE_MOSTLY_PTQ1_0,   " 1.75 bpw ternary, base-3 (Prism)", },
     { "PQ2_0_R8", LLAMA_FTYPE_MOSTLY_PQ2_0_R8, " 2.13 bpw ternary, group-128 (Prism)", },
     { "PTQ1_0_R8",LLAMA_FTYPE_MOSTLY_PTQ1_0_R8," 1.75 bpw ternary, base-3 (Prism)", },
+    { "Q1_0_G128", LLAMA_FTYPE_MOSTLY_Q1_0_G128, " 1.125 bpw Bonsai 1-bit, group-128", },
+    { "Q1_0_G128_R8",LLAMA_FTYPE_MOSTLY_Q1_0_G128_R8, " 1.125 bpw Bonsai 1-bit, group-128, 8-row repacked", },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.63G, +0.6717 ppl @ LLaMA-v1-7B", },
     { "Q2_K_R4",  LLAMA_FTYPE_MOSTLY_Q2_K_R4,  "Q2_K_S repacked", },
     { "Q2_K_S",   LLAMA_FTYPE_MOSTLY_Q2_K_S,   " 2.16G, +9.0634 ppl @ LLaMA-v1-7B", },
