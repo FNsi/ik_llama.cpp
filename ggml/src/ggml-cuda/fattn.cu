@@ -200,9 +200,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool sm70_quantized = cc >= CC_VOLTA && cc < CC_TURING && precision == GGML_PREC_DEFAULT &&
             (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_Q8_0) &&
             K->type == V->type && K->ne[0] == 256;
+    // sm_70 f16 KV decode: vec_f32 (f32-accum dot, f32 exp, 2x shared) is the legacy precision path; with
+    // PREC_DEFAULT the half-accum vec_f16 kernel is a strict win on Volta. sm_60 and PREC_HIGH keep vec_f32
+    // (see llama.cpp#25593: f16 accum flips decode top-1 on P100).
+    const bool sm70_f16 = cc >= CC_VOLTA && cc < CC_TURING && precision == GGML_PREC_DEFAULT &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
     if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 &&
         (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type) || sm70_quantized)) {
-        if (sm70_quantized) {
+        if (sm70_f16 || sm70_quantized) {
             ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
             return;
         }
@@ -308,10 +313,13 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const bool sm70_quantized = cc >= CC_VOLTA && cc < CC_TURING && precision == GGML_PREC_DEFAULT &&
             (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_Q8_0) &&
             K->type == V->type && K->ne[0] == 256;
+    // Mirror of the sm70_f16 decode dispatch above:
+    const bool sm70_f16 = cc >= CC_VOLTA && cc < CC_TURING && precision == GGML_PREC_DEFAULT &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
     if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 &&
         (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type) || sm70_quantized)) {
-        return sm70_quantized ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
-                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+        return (sm70_f16 || sm70_quantized) ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
+                                             : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
     }
     if (sm70_quantized && can_use_vector_kernel) {
         return ggml_cuda_fattn_vec_f16_is_supported(ctx, dst);
