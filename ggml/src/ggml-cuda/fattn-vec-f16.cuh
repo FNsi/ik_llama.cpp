@@ -43,12 +43,6 @@ static __global__ void flash_attn_vec_ext_f16(
         return;
     }
     }
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (ncols > 1) {
-        NO_DEVICE_CODE;
-        return;
-    }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
