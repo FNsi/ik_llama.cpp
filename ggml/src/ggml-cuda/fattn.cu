@@ -194,10 +194,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     //const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && cc < CC_ADA_LOVELACE && !mma_needs_data_conversion;
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && K->ne[0] == V->ne[0] && Q->ne[0] % (2*WARP_SIZE) == 0;
-    // On sm_70 (Volta) there is no Turing+ MMA kernel; quantized KV (decode and prefill) would fall back
-    // to the WMMA kernel, which re-converts the full KV cache to f16 scratch on every call, so prefer
-    // vec_f16 there (multi-column, up to 8 columns per block).
-    const bool sm70_quantized = cc >= CC_VOLTA && cc < CC_TURING && precision == GGML_PREC_DEFAULT &&
+    // On sm_70 (Volta) there is no Turing+ MMA kernel; quantized KV decode would fall back to the WMMA
+    // kernel, which re-converts the full KV cache to f16 scratch on every call, so prefer vec_f16 there.
+    // Decode only (Q->ne[1] == 1): for prefill the WMMA kernel is the faster path despite the conversion,
+    // because one dequantization is amortized over all query rows of the batch, whereas the vec kernel
+    // rescans K/V per query row. Measured (V100, q4_0 KV, hs 256, 2048-token prompts): WMMA 462-516 t/s
+    // vs vec_f16 254-372 t/s, and the vec-for-prefill curve collapsed with context where WMMA stays flat.
+    const bool sm70_quantized = cc >= CC_VOLTA && cc < CC_TURING && Q->ne[1] == 1 && precision == GGML_PREC_DEFAULT &&
             (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_Q8_0) &&
             K->type == V->type && K->ne[0] == 256;
     // sm_70 f16 KV decode: vec_f32 (f32-accum dot, f32 exp, 2x shared) is the legacy precision path; with
@@ -214,10 +217,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
         return;
     }
-    if (sm70_quantized && can_use_vector_kernel) {
-        ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
-        return;
-    }
+
 
     //
     // It turns out the new MMA implementation is slower than the
@@ -310,7 +310,7 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && K->ne[0] == V->ne[0] && Q->ne[0] % (2*WARP_SIZE) == 0;
     // Mirror of the sm70_quantized dispatch above (keep the two in sync):
-    const bool sm70_quantized = cc >= CC_VOLTA && cc < CC_TURING && precision == GGML_PREC_DEFAULT &&
+    const bool sm70_quantized = cc >= CC_VOLTA && cc < CC_TURING && Q->ne[1] == 1 && precision == GGML_PREC_DEFAULT &&
             (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_Q8_0) &&
             K->type == V->type && K->ne[0] == 256;
     // Mirror of the sm70_f16 decode dispatch above:
@@ -321,9 +321,7 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
         return (sm70_f16 || sm70_quantized) ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                              : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
     }
-    if (sm70_quantized && can_use_vector_kernel) {
-        return ggml_cuda_fattn_vec_f16_is_supported(ctx, dst);
-    }
+
 
     if (new_mma_available(cc) &&
             (Q->ne[0] == 576 || Q->ne[0] == 320 || Q->ne[0] == 512 || (K->ne[0] == 192 && V->ne[0] == 128 && mma_better_than_turing(cc)))) {
